@@ -74,7 +74,6 @@ def watch(config, logger):
         for line in proc.stdout:
             parts = line.strip().split(" ", 1)
             if len(parts) == 2 and parts[1].endswith(".conf"):
-                logger.info(f"inotify event: {line.strip()}")
                 logger.debug(f"inotify event: {line.strip()}")
                 schedule_debounce()
 
@@ -815,9 +814,9 @@ def apply_client_max_body_size(config, logger):
     features     = config.get("nginx", {}).get("features", {})
     cfg_size     = features.get("client_max_body_size", "200m")
 
-    conf_files   = _site_confs()
-    is_cp_server = any(f.name.startswith("000-") for f in conf_files)
-    conf_files   = [f for f in conf_files if f.name != "default.conf"]
+    all_confs    = list(SITES_DIR.glob("*.conf"))
+    is_cp_server = any(f.name.startswith("000-") for f in all_confs)
+    conf_files   = [f for f in all_confs if not f.name.startswith("000-") and f.name != "default.conf"]
     any_changed  = False
 
     for cf in conf_files:

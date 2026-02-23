@@ -58,25 +58,10 @@ webservertune-enhance is an automated configuration management service for Enhan
 
 ### Quick Install
 ```bash
-# Clone the repository
-cd /opt
-git clone https://github.com/rdbf/webservertune-enhance.git
-
-# Create config file
-cd /opt/webservertune-enhance
-cp settings.conf.example settings.conf
-
-# Edit settings.conf with your desired values and Enhance API token
-nano settings.conf
-
-# Set correct permissions
-chmod 755 webservertune-enhance modules/*
-chmod 640 settings.conf
-
-# Install inotify-tools if not already installed
-apt install inotify-tools
-
-# Enable and start the service
+git clone https://github.com/rdbf/webservertune-enhance.git /opt/webservertune-enhance
+cp /opt/webservertune-enhance/settings.conf.example /opt/webservertune-enhance/settings.conf
+chmod 640 /opt/webservertune-enhance/settings.conf
+nano /opt/webservertune-enhance/settings.conf
 systemctl enable /opt/webservertune-enhance/webservertune-enhance.service
 systemctl start webservertune-enhance
 ```
@@ -84,9 +69,16 @@ systemctl start webservertune-enhance
 ### Updates
 ```bash
 cd /opt/webservertune-enhance
-git pull origin main
+git pull
 systemctl restart webservertune-enhance
 ```
+
+### Migration from nginxtune-enhance
+
+1. Remove or comment out the nginxtune-enhance cron job: `crontab -e`
+2. Follow the Quick Install steps above, copying across your existing config values
+3. Verify the service works correctly and behaves as before
+4. Remove `/opt/nginxtune-enhance` if desired
 
 ### Verification
 ```bash
@@ -155,57 +147,51 @@ When `persistent_logging` is enabled under `[nginx-features]`:
 
 The `settings.conf` file uses TOML format and controls all features through a single file.
 
-### General Settings
-```toml
-[general]
-log_level = "INFO"           # DEBUG, INFO, WARNING
-debounce_seconds = 10        # Wait time after inotify event before running
-```
+### General
 
-### Nginx Features
-```toml
-[nginx-features]
-http3_enable = false
-quic_gso_enable = false
-ssl_upgrade = false
-server_hardening = false
-cms_protection = false
-persistent_logging = false
-real_ip_logging = false
-fastcgi_cache_inactive = "60m"
-fastcgi_cache_valid = "60m"
-client_max_body_size = "200m"
-backup_retention_days = 30
-```
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `log_level` | `INFO` | Log verbosity: `DEBUG` (everything), `INFO` (normal operations), `WARNING` (unexpected events and errors only) |
+| `debounce_seconds` | `10` | Seconds to wait after a file change event before acting, to avoid reacting to partial writes |
+
+### Nginx
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` |
+| `http3_enable` | `false` | HTTP/3 support: QUIC listeners, Alt-Svc headers, FastCGI HTTP_HOST fix |
+| `quic_gso_enable` | `false` | QUIC Generic Segmentation Offloading — requires `http3_enable = true` |
+| `ssl_upgrade` | `false` | Include `overrides/ssl.conf` — modern TLS settings |
+| `server_hardening` | `false` | Include `overrides/hardening.conf` — server hardening rules |
+| `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
+| `persistent_logging` | `false` | Persistent access logs to `/var/www/<UUID>/logs/webserver.log` |
+| `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` |
+| `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
+| `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
+| `client_max_body_size` | `200m` | Maximum upload and request body size |
 
 ### OLS Webserver Settings
-Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys and named blocks:
-```toml
-[ols-webserver.general]
-inMemBufSize = "128M"
-showVersionNumber = "0"
 
-[ols-webserver.tuning]
-maxConnections = "10000"
-sndBufSize = "512K"
-rcvBufSize = "512K"
+Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `[ols-webserver.general]` and named blocks such as `[ols-webserver.tuning]`. Any block name must match exactly as it appears in `httpd_config.conf`. Several commented out values are included in `settings.conf.example` for reference.
 
-backup_retention_days = 30
-```
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `backup_retention_days` | `30` | Days to retain backups in `backups/ols/` |
 
 ### OLS 503 Fix
-```toml
-[ols-503fix]
-error_threshold = 5           # Number of 503s to trigger a restart
-window_seconds = 30           # Time window for counting 503s
-last_n_requests = 10          # Minimum recent requests before triggering
-error_percentage = 50         # Percentage of last_n_requests that must be 503s
-cooldown_seconds = 300        # Minimum time between restarts for same site
-enhance_api_url = "https://your-panel.example.com"
-enhance_api_token = "your-token-here"
-```
 
-All Nginx features are disabled by default, with FastCGI cache and Client Max Body Size values set to match Enhance's auto-generated defaults.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enhance_url` | — | Enhance panel API URL |
+| `enhance_token` | — | Enhance API bearer token |
+| `window_seconds` | `30` | Sliding window in seconds for 503 counting |
+| `min_503_count` | `5` | Minimum 503 count within the window before evaluating a restart |
+| `min_503_percent` | `50` | Minimum percentage of recent requests that must be 503s to trigger a restart |
+| `last_n_requests` | `10` | Request sample size for percentage calculation |
+| `cooldown_seconds` | `60` | Minimum time between restarts for the same site |
+| `scan_interval` | `1` | Log polling interval in seconds |
+
+All Nginx and OpenLiteSpeed features are disabled by default, with FastCGI cache and Client Max Body Size values set to match Enhance's auto-generated defaults.
 
 ## Known Issues
 

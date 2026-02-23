@@ -53,11 +53,11 @@ backup_retention_days = 30
 
 
 [ols-503fix]
-#enhance_url      = "https://example.com/api"
-#enhance_token    = ""
-#window_seconds   = 30
-#min_503_count    = 5
-#min_503_percent  = 50
-#last_n_requests  = 10
-#cooldown_seconds = 60
-#scan_interval    = 1
+enhance_url      = "https://example.com/api"
+enhance_token    = ""
+window_seconds   = 30
+min_503_count    = 5
+min_503_percent  = 50
+last_n_requests  = 10
+cooldown_seconds = 60
+scan_interval    = 1

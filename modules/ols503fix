@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+ols503fix
+Monitors per-site webserver logs and restarts PHP via the Enhance API
+when 503 error thresholds are exceeded.
+Called by webservertune-enhance orchestrator.
+"""
+
+import re
+import time
+from collections import deque
+
+import requests
+
+LOG_DIR     = "/var/local/enhance/webserver_logs"
+LOG_PATTERN = re.compile(r'"([^"]*)"')
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def run(config, logger):
+    cfg = config.get("ols-503fix", {})
+
+    logger.info(
+        f"ols503fix starting — window={cfg.get('window_seconds', 30)}s, "
+        f"min_503={cfg.get('min_503_count', 5)}, "
+        f"last_n={cfg.get('last_n_requests', 10)}, "
+        f"min_pct={cfg.get('min_503_percent', 50)}%, "
+        f"cooldown={cfg.get('cooldown_seconds', 60)}s"
+    )
+
+    registry    = SiteRegistry(cfg, logger)
+    scan_count  = 0
+
+    while True:
+        if scan_count % 20 == 0:
+            registry.scan()
+        scan_count += 1
+        registry.process()
+        time.sleep(cfg.get("scan_interval", 1))
+
+
+# ---------------------------------------------------------------------------
+# Log parsing
+# ---------------------------------------------------------------------------
+
+def _parse_status(line):
+    matches = LOG_PATTERN.findall(line)
+    if len(matches) >= 4:
+        try:
+            return int(matches[3])
+        except ValueError:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Site state
+# ---------------------------------------------------------------------------
+
+class SiteState:
+    def __init__(self, website_id, config):
+        self.website_id     = website_id
+        self.config         = config
+        self.all_requests   = deque()
+        self.errors_503     = deque()
+        self.errors_503_24h = deque()
+        self.last_restart   = 0.0
+
+    def record(self, status_code):
+        now = time.time()
+        self.all_requests.append(now)
+        if status_code == 503:
+            self.errors_503.append(now)
+            self.errors_503_24h.append(now)
+
+    def _prune(self, now):
+        cutoff = now - self.config.get("window_seconds", 30)
+        while self.all_requests and self.all_requests[0] < cutoff:
+            self.all_requests.popleft()
+        while self.errors_503 and self.errors_503[0] < cutoff:
+            self.errors_503.popleft()
+        cutoff_24h = now - 86400
+        while self.errors_503_24h and self.errors_503_24h[0] < cutoff_24h:
+            self.errors_503_24h.popleft()
+
+    def count_24h(self):
+        now = time.time()
+        cutoff = now - 86400
+        while self.errors_503_24h and self.errors_503_24h[0] < cutoff:
+            self.errors_503_24h.popleft()
+        return len(self.errors_503_24h)
+
+    def should_restart(self, logger):
+        now = time.time()
+        self._prune(now)
+
+        total  = len(self.all_requests)
+        errors = len(self.errors_503)
+
+        logger.debug(f"[{self.website_id}] window: {total} total, {errors} x 503")
+
+        if errors < self.config.get("min_503_count", 5):
+            return False, total, errors, 0
+
+        last_n  = self.config.get("last_n_requests", 10)
+        recent  = list(self.all_requests)[-last_n:]
+        if not recent:
+            return False, total, errors, 0
+
+        recent_503 = sum(1 for t in self.errors_503 if t >= recent[0])
+        pct        = recent_503 / len(recent) * 100
+
+        logger.debug(
+            f"[{self.website_id}] last {len(recent)} requests: {recent_503} x 503 ({pct:.0f}%)"
+        )
+
+        if pct < self.config.get("min_503_percent", 50):
+            return False, total, errors, pct
+
+        cooldown = self.config.get("cooldown_seconds", 60)
+        if now - self.last_restart < cooldown:
+            logger.debug(
+                f"[{self.website_id}] threshold met but in cooldown "
+                f"({cooldown - (now - self.last_restart):.0f}s remaining)"
+            )
+            return False, total, errors, pct
+
+        return True, total, errors, pct
+
+    def mark_restarted(self):
+        self.last_restart = time.time()
+        self.all_requests.clear()
+        self.errors_503.clear()
+
+
+# ---------------------------------------------------------------------------
+# File watcher
+# ---------------------------------------------------------------------------
+
+class FileWatcher:
+    def __init__(self, path, logger):
+        self.path     = path
+        self.logger   = logger
+        self.fh       = None
+        self.inode    = None
+        self.position = 0
+        self._open()
+
+    def _open(self):
+        try:
+            self.fh       = open(self.path, "r", errors="replace")
+            self.inode    = __import__("os").fstat(self.fh.fileno()).st_ino
+            self.fh.seek(0, 2)
+            self.position = self.fh.tell()
+            self.logger.debug(f"Opened: {self.path} (inode {self.inode})")
+        except OSError:
+            self.fh    = None
+            self.inode = None
+
+    def _reopen_if_needed(self):
+        import os
+        try:
+            stat = os.stat(self.path)
+        except OSError:
+            if self.fh:
+                self.fh.close()
+                self.fh    = None
+                self.inode = None
+            return
+
+        if self.fh is None:
+            self._open()
+            return
+
+        if stat.st_ino != self.inode:
+            self.logger.debug(f"Recreated: {self.path}")
+            self.fh.close()
+            self._open()
+            return
+
+        if stat.st_size < self.position:
+            self.logger.debug(f"Truncated: {self.path}")
+            self.fh.seek(0)
+            self.position = 0
+
+    def readlines(self):
+        self._reopen_if_needed()
+        if self.fh is None:
+            return []
+        lines         = self.fh.readlines()
+        self.position = self.fh.tell()
+        return lines
+
+    def close(self):
+        if self.fh:
+            self.fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Site registry
+# ---------------------------------------------------------------------------
+
+class SiteRegistry:
+    def __init__(self, config, logger):
+        self.config   = config
+        self.logger   = logger
+        self.watchers = {}
+        self.states   = {}
+
+    def scan(self):
+        import os
+        try:
+            current = {
+                f[:-4]: __import__("os").path.join(LOG_DIR, f)
+                for f in os.listdir(LOG_DIR)
+                if f.endswith(".log")
+            }
+        except OSError as e:
+            self.logger.error(f"Cannot scan log directory {LOG_DIR}: {e}")
+            return
+
+        for wid, path in current.items():
+            if wid not in self.watchers:
+                self.logger.debug(f"New site: {wid}")
+                self.watchers[wid] = FileWatcher(path, self.logger)
+                self.states[wid]   = SiteState(wid, self.config)
+
+        for wid in list(self.watchers):
+            if wid not in current:
+                self.logger.debug(f"Site removed: {wid}")
+                self.watchers[wid].close()
+                del self.watchers[wid]
+                del self.states[wid]
+
+    def process(self):
+        for wid, watcher in list(self.watchers.items()):
+            state  = self.states[wid]
+            before = len(state.errors_503_24h)
+
+            for line in watcher.readlines():
+                line = line.strip()
+                if not line:
+                    continue
+                status = _parse_status(line)
+                if status is not None:
+                    state.record(status)
+
+            after = state.count_24h()
+            if after > before:
+                self.logger.info(f"[{wid}] 503 count last 24h: {after}")
+
+            trigger, total, errors, pct = state.should_restart(self.logger)
+            if trigger:
+                self.logger.info(
+                    f"[{wid}] Restarting PHP — {errors} x 503 in "
+                    f"{self.config.get('window_seconds', 30)}s window, "
+                    f"{pct:.0f}% of last {self.config.get('last_n_requests', 10)} requests"
+                )
+                success = _restart_php(wid, self.config, self.logger)
+                state.mark_restarted()
+                if success:
+                    self.logger.info(f"[{wid}] PHP restart confirmed")
+                else:
+                    self.logger.error(f"[{wid}] PHP restart FAILED — will retry after cooldown")
+
+
+# ---------------------------------------------------------------------------
+# Enhance API
+# ---------------------------------------------------------------------------
+
+def _restart_php(website_id, config, logger):
+    url     = f"{config.get('enhance_url', '').rstrip('/')}/v2/websites/{website_id}/restart_php"
+    headers = {"Authorization": f"Bearer {config.get('enhance_token', '')}"}
+    try:
+        resp = requests.post(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return True
+        logger.error(
+            f"[{website_id}] API restart_php returned {resp.status_code}: {resp.text[:200]}"
+        )
+        return False
+    except requests.RequestException as e:
+        logger.error(f"[{website_id}] API restart_php request failed: {e}")
+        return False

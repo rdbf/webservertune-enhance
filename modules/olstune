@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+olstune
+OpenLiteSpeed httpd_config.conf enforcer for Enhance hosting environments.
+Enforces key/value pairs defined in settings.conf whenever the file changes.
+Called by webservertune-enhance orchestrator.
+"""
+
+import shutil
+import subprocess
+import threading
+from datetime import datetime
+from pathlib import Path
+
+OLS_CONF    = Path("/usr/local/lsws/conf/httpd_config.conf")
+BACKUP_BASE = Path("/opt/webservertune-enhance/backups/ols")
+OLS_RESTART = ["/usr/local/lsws/bin/lswsctrl", "restart"]
+
+
+# ---------------------------------------------------------------------------
+# inotify watch + debounce
+# ---------------------------------------------------------------------------
+
+def watch(config, logger):
+    """Entry point called by orchestrator. Runs startup check then watches for changes."""
+    logger.info("olstune starting")
+    run(config, logger)
+
+    watch_dir     = str(OLS_CONF.parent)
+    debounce_secs = config.get("general", {}).get("debounce_seconds", 10)
+
+    cmd = [
+        "inotifywait", "--monitor", "--quiet",
+        "--format", "%e %f",
+        "--event", "modify",
+        "--event", "create",
+        "--event", "moved_to",
+        watch_dir,
+    ]
+
+    debounce_timer = None
+    debounce_lock  = threading.Lock()
+
+    def debounced_run():
+        run(config, logger)
+
+    def schedule_debounce():
+        nonlocal debounce_timer
+        with debounce_lock:
+            if debounce_timer is not None:
+                debounce_timer.cancel()
+            debounce_timer = threading.Timer(debounce_secs, debounced_run)
+            debounce_timer.start()
+
+    def watch_loop():
+        import time
+        while True:
+            try:
+                logger.info(f"Watching {watch_dir} via inotifywait")
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+            except FileNotFoundError:
+                logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
+                return
+            except Exception as e:
+                logger.error(f"Failed to start inotifywait: {e}")
+                time.sleep(5)
+                continue
+
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 1)
+                if len(parts) == 2 and parts[1] == OLS_CONF.name:
+                    logger.info(f"inotify event: {line.strip()}")
+                    logger.debug(f"inotify event: {line.strip()}")
+                    schedule_debounce()
+
+            ret = proc.wait()
+            logger.warning(f"inotifywait exited (code {ret}), restarting watch in 5s")
+            time.sleep(5)
+
+    watcher = threading.Thread(target=watch_loop, daemon=True)
+    watcher.start()
+    watcher.join()
+
+
+# ---------------------------------------------------------------------------
+# Main run: backup → enforce → restart
+# ---------------------------------------------------------------------------
+
+def run(config, logger):
+    if not OLS_CONF.exists():
+        logger.error(f"OLS config not found: {OLS_CONF}")
+        return
+
+    logger.debug("Running enforcement check")
+
+    ols_config = config.get("ols-webserver", {})
+    lines      = OLS_CONF.read_text().splitlines(keepends=True)
+    changed    = False
+
+    for section, desired in ols_config.items():
+        if section == "backup_retention_days":
+            continue
+        if not isinstance(desired, dict):
+            continue
+        if section.lower() == "general":
+            logger.debug("Enforcing section: general (top-level keys)")
+            lines, section_changed = _enforce_general(lines, desired, logger)
+        else:
+            logger.debug(f"Enforcing block: '{section}'")
+            lines, section_changed = _enforce_block(lines, section, desired, logger)
+        if section_changed:
+            changed = True
+
+    if not changed:
+        logger.info("All target values correct, no changes needed")
+        return
+
+    _create_backup(logger)
+
+    logger.info("Writing updated config")
+    OLS_CONF.write_text("".join(lines))
+
+    logger.debug("Triggering OLS restart")
+    _restart_ols(logger)
+
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+
+def _create_backup(logger):
+    backup_path = BACKUP_BASE / datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        backup_path.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(OLS_CONF, backup_path / OLS_CONF.name)
+        logger.info(f"Backup created: {backup_path}")
+    except Exception as e:
+        logger.error(f"Failed to create backup: {e}")
+
+
+# ---------------------------------------------------------------------------
+# OLS restart
+# ---------------------------------------------------------------------------
+
+def _restart_ols(logger):
+    try:
+        result = subprocess.run(OLS_RESTART, capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info("OLS restart successful")
+        else:
+            logger.error(f"OLS restart failed: {result.stderr.strip()}")
+    except Exception as e:
+        logger.error(f"OLS restart error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Config enforcers (ported from settings-persist)
+# ---------------------------------------------------------------------------
+
+def _enforce_general(lines, desired, logger):
+    new_lines     = []
+    changed       = False
+    keys_seen     = set()
+    insert_before = None
+    depth         = 0
+
+    desired_lower = {k.lower(): (k, v) for k, v in desired.items()}
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.endswith("{"):
+            if depth == 0 and insert_before is None:
+                insert_before = len(new_lines)
+            depth += stripped.count("{")
+        if "}" in stripped:
+            depth -= stripped.count("}")
+
+        if depth == 0:
+            parts = stripped.split(None, 1)
+            if len(parts) == 2:
+                indent = line[: len(line) - len(line.lstrip())]
+                key_lower = parts[0].lower()
+                if key_lower in desired_lower:
+                    keys_seen.add(key_lower)
+                    key_out, val_out = desired_lower[key_lower]
+                    current_val = parts[1].strip()
+                    if current_val != val_out:
+                        new_lines.append(f"{indent}{key_out:<26}{val_out}\n")
+                        logger.info(f"  AMENDED  {key_out}: '{current_val}' -> '{val_out}'")
+                        changed = True
+                        continue
+
+        new_lines.append(line)
+
+    if insert_before is None:
+        insert_before = len(new_lines)
+
+    # Walk backwards past any blank lines so insertions land with the other keys
+    while insert_before > 0 and not new_lines[insert_before - 1].strip():
+        insert_before -= 1
+
+    inserts = []
+    for key_lower, (key_out, val_out) in desired_lower.items():
+        if key_lower not in keys_seen:
+            inserts.append(f"        {key_out:<26}{val_out}\n")
+            logger.info(f"  INSERTED {key_out} = {val_out}")
+            changed = True
+
+    if inserts:
+        new_lines = new_lines[:insert_before] + inserts + new_lines[insert_before:]
+
+    return new_lines, changed
+
+
+def _enforce_block(lines, target_block, desired, logger):
+    new_lines     = []
+    changed       = False
+    in_block      = False
+    depth         = 0
+    keys_seen     = set()
+    block_found   = False
+    block_indent  = "  "
+    insert_before = None
+
+    desired_lower = {k.lower(): (k, v) for k, v in desired.items()}
+
+    i = 0
+    while i < len(lines):
+        line     = lines[i]
+        stripped = line.strip()
+
+        if not in_block:
+            normalised = " ".join(stripped.rstrip("{").split()).lower()
+            if normalised == target_block.lower() and stripped.endswith("{"):
+                in_block    = True
+                block_found = True
+                depth       = 1
+                new_lines.append(line)
+                i += 1
+                continue
+
+        if in_block:
+            if "{" in stripped:
+                depth += stripped.count("{")
+            if "}" in stripped:
+                depth -= stripped.count("}")
+
+            if depth == 0:
+                # Find insert point by walking back past blank lines
+                insert_before = len(new_lines)
+                while insert_before > 0 and not new_lines[insert_before - 1].strip():
+                    insert_before -= 1
+
+                inserts = []
+                for key_lower, (key_out, val_out) in desired_lower.items():
+                    if key_lower not in keys_seen:
+                        inserts.append(f"{block_indent}{key_out:<24}{val_out}\n")
+                        logger.info(f"  INSERTED {key_out} = {val_out}")
+                        changed = True
+
+                if inserts:
+                    new_lines = new_lines[:insert_before] + inserts + new_lines[insert_before:]
+
+                in_block = False
+                new_lines.append(line)
+                i += 1
+                continue
+
+            parts = stripped.split(None, 1)
+            if len(parts) == 2 and depth == 1:
+                current_indent = line[: len(line) - len(line.lstrip())]
+                if current_indent:
+                    block_indent = current_indent
+                key_lower = parts[0].lower()
+                if key_lower in desired_lower:
+                    keys_seen.add(key_lower)
+                    key_out, val_out = desired_lower[key_lower]
+                    current_val = parts[1].strip()
+                    if current_val != val_out:
+                        indent = line[: len(line) - len(line.lstrip())]
+                        new_lines.append(f"{indent}{key_out:<24}{val_out}\n")
+                        logger.info(f"  AMENDED  {key_out}: '{current_val}' -> '{val_out}'")
+                        changed = True
+                        i += 1
+                        continue
+
+        new_lines.append(line)
+        i += 1
+
+    if not block_found:
+        logger.warning(f"Block '{target_block}' not found in config")
+
+    return new_lines, changed

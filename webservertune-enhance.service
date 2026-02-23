@@ -1,0 +1,16 @@
+[Unit]
+Description=webservertune-enhance — Nginx and OLS configuration manager for Enhance
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/webservertune-enhance/webservertune-enhance
+WorkingDirectory=/opt/webservertune-enhance
+Restart=always
+RestartSec=5
+User=root
+LogsDirectory=webservertune-enhance
+LogsDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

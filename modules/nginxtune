@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""
+nginxtune
+Nginx configuration management for Enhance hosting environments.
+Manages HTTP/3, security includes, logging, FastCGI cache and body size settings.
+Called by webservertune-enhance orchestrator.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+SITES_DIR    = Path("/etc/nginx/sites-enabled")
+BACKUP_BASE  = Path("/opt/webservertune-enhance/backups/nginx")
+OVERRIDES    = Path("/opt/webservertune-enhance/overrides")
+ALT_SVC      = 'h3=":443"; ma=86400'
+
+
+# ---------------------------------------------------------------------------
+# inotify watch + debounce
+# ---------------------------------------------------------------------------
+
+def watch(config, logger):
+    """Entry point called by orchestrator. Runs startup check then watches for changes."""
+    logger.info("nginxtune starting")
+
+    # Brief delay on startup to allow nginx to fully initialise before
+    # attempting any config changes or reloads
+    time.sleep(15)
+
+    run(config, logger)
+
+    cmd = [
+        "inotifywait", "--monitor", "--quiet",
+        "--format", "%e %f",
+        "--event", "modify",
+        "--event", "create",
+        "--event", "moved_to",
+        str(SITES_DIR),
+    ]
+
+    debounce_timer = None
+    debounce_lock  = threading.Lock()
+    debounce_secs  = config.get("general", {}).get("debounce_seconds", 10)
+
+    def debounced_run():
+        run(config, logger)
+
+    def schedule_debounce():
+        nonlocal debounce_timer
+        with debounce_lock:
+            if debounce_timer is not None:
+                debounce_timer.cancel()
+            debounce_timer = threading.Timer(debounce_secs, debounced_run)
+            debounce_timer.start()
+
+    while True:
+        try:
+            logger.info(f"Watching {SITES_DIR} via inotifywait")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
+            return
+        except Exception as e:
+            logger.error(f"Failed to start inotifywait: {e}")
+            time.sleep(5)
+            continue
+
+        for line in proc.stdout:
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2 and parts[1].endswith(".conf"):
+                logger.info(f"inotify event: {line.strip()}")
+                logger.debug(f"inotify event: {line.strip()}")
+                schedule_debounce()
+
+        ret = proc.wait()
+        logger.warning(f"inotifywait exited (code {ret}), restarting watch in 5s")
+        time.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Main run: backup → apply → test → reload or restore
+# ---------------------------------------------------------------------------
+
+def run(config, logger):
+    backup_dir = _create_backup(logger)
+    if not backup_dir:
+        logger.error("Backup failed, aborting run")
+        return
+
+    nginx_cfg = config.get("nginx", {})
+
+    changed  = False
+    changed |= apply_http3_enable(config, logger)
+    changed |= apply_quic_gso_enable(config, logger)
+    changed |= apply_include_features(config, logger)
+    changed |= apply_logging_features(config, logger)
+    changed |= apply_fastcgi_cache_settings(config, logger)
+    changed |= apply_client_max_body_size(config, logger)
+
+    if not changed:
+        logger.info("All configs up to date, no changes needed")
+        _cleanup_backup(backup_dir, logger)
+        _cleanup_old_backups(nginx_cfg.get("backup_retention_days", 30), logger)
+        return
+
+    ok, output = _test_nginx()
+    if not ok:
+        logger.error(f"nginx -t failed: {output}")
+        if _restore_backup(backup_dir, logger):
+            logger.info("Configs restored from backup")
+        _cleanup_backup(backup_dir, logger)
+        return
+
+    if _reload_nginx(logger):
+        logger.info("Configuration updated, nginx reloaded")
+    else:
+        logger.error(f"nginx reload failed — restoring backup and restarting service")
+        if _restore_backup(backup_dir, logger):
+            if _reload_nginx(logger):
+                logger.info("Restored config reloaded successfully")
+            else:
+                logger.error("Reload of restored config also failed")
+        else:
+            logger.error("Backup restore failed")
+        logging.shutdown()
+        os._exit(0)
+
+    _cleanup_old_backups(nginx_cfg.get("backup_retention_days", 30), logger)
+
+
+# ---------------------------------------------------------------------------
+# Backup helpers
+# ---------------------------------------------------------------------------
+
+def _create_backup(logger):
+    backup_dir = BACKUP_BASE / datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        for f in SITES_DIR.glob("*.conf"):
+            shutil.copy2(f, backup_dir)
+        logger.info(f"Backup created: {backup_dir}")
+        return backup_dir
+    except Exception as e:
+        logger.error(f"Failed to create backup: {e}")
+        return None
+
+
+def _restore_backup(backup_dir, logger):
+    try:
+        for f in backup_dir.glob("*.conf"):
+            shutil.copy2(f, SITES_DIR / f.name)
+        logger.info(f"Restored from backup: {backup_dir}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to restore backup: {e}")
+        return False
+
+
+def _cleanup_backup(backup_dir, logger):
+    try:
+        shutil.rmtree(backup_dir)
+        logger.debug(f"Removed backup: {backup_dir}")
+    except Exception as e:
+        logger.error(f"Failed to remove backup {backup_dir}: {e}")
+
+
+def _cleanup_old_backups(retention_days, logger):
+    try:
+        if not BACKUP_BASE.exists():
+            return
+        cutoff = datetime.now() - timedelta(days=retention_days)
+        removed = 0
+        for d in BACKUP_BASE.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                ts = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
+                if ts < cutoff:
+                    shutil.rmtree(d)
+                    removed += 1
+            except ValueError:
+                continue
+        if removed:
+            logger.info(f"Removed {removed} old backup(s) older than {retention_days} days")
+    except Exception as e:
+        logger.error(f"Failed to clean up old backups: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Nginx helpers
+# ---------------------------------------------------------------------------
+
+def _test_nginx():
+    try:
+        result = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+        return result.returncode == 0, result.stderr
+    except Exception as e:
+        return False, str(e)
+
+
+def _reload_nginx(logger):
+    try:
+        result = subprocess.run(
+            ["systemctl", "reload", "nginx"], capture_output=True, text=True
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.error(f"Failed to reload nginx: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Indentation helpers
+# ---------------------------------------------------------------------------
+
+def _indent(lines, index, fallback="    "):
+    try:
+        line = lines[index]
+        n    = len(line) - len(line.lstrip())
+        return " " * n
+    except Exception:
+        return fallback
+
+
+def _php_indent(lines, index, fallback="                "):
+    try:
+        line = lines[index]
+        n    = len(line) - len(line.lstrip())
+        return " " * (n + 4)
+    except Exception:
+        return fallback
+
+
+# ---------------------------------------------------------------------------
+# apply_http3_enable
+# ---------------------------------------------------------------------------
+
+def apply_http3_enable(config, logger):
+    features     = config.get("nginx", {}).get("features", {})
+    http3        = features.get("http3_enable", False)
+    conf_files   = _site_confs()
+    any_changed  = False
+
+    for cf in conf_files:
+        filename   = cf.name
+        is_default = filename == "default.conf"
+
+        try:
+            lines = cf.read_text().splitlines(keepends=True)
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            continue
+
+        has_php = any("location ~ \\.php$" in l for l in lines)
+
+        # Target state
+        if is_default:
+            if http3:
+                t_listeners  = [
+                    "listen 80 default_server reuseport",
+                    "listen [::]:80 default_server reuseport",
+                    "listen 443 ssl default_server reuseport",
+                    "listen [::]:443 ssl default_server reuseport",
+                    "listen 443 quic default_server reuseport",
+                    "listen [::]:443 quic default_server reuseport",
+                ]
+                t_directives = ["http2 on", "http3 on"]
+            else:
+                t_listeners  = [
+                    "listen 80 default_server reuseport",
+                    "listen [::]:80 default_server reuseport",
+                    "listen 443 ssl http2 default_server reuseport",
+                    "listen [::]:443 ssl http2 default_server reuseport",
+                ]
+                t_directives = []
+            t_headers  = []
+            t_php_adds = []
+        else:
+            if http3:
+                t_listeners  = [
+                    "listen 80",
+                    "listen [::]:80",
+                    "listen 443 ssl",
+                    "listen [::]:443 ssl",
+                    "listen 443 quic",
+                    "listen [::]:443 quic",
+                ]
+                t_directives = ["http2 on", "http3 on"]
+                t_headers    = [f"add_header Alt-Svc '{ALT_SVC}'"]
+                t_php_adds   = ([f"add_header Alt-Svc '{ALT_SVC}'", "fastcgi_param HTTP_HOST $host"]
+                                if has_php else [])
+            else:
+                t_listeners  = [
+                    "listen 80",
+                    "listen [::]:80",
+                    "listen 443 ssl http2",
+                    "listen [::]:443 ssl http2",
+                ]
+                t_directives = []
+                t_headers    = []
+                t_php_adds   = []
+
+        # Current state
+        c_listeners = []
+        c_directives = []
+        c_headers    = []
+        c_php_adds   = []
+        in_php       = False
+
+        for line in lines:
+            s = line.strip()
+            if s.startswith("listen ") and not s.startswith("#"):
+                if any(p in s for p in ["80", "443"]):
+                    c_listeners.append(s.rstrip(";"))
+            elif s in ["http2 on;", "http3 on;"]:
+                c_directives.append(s.rstrip(";"))
+            elif f"add_header Alt-Svc '{ALT_SVC}'" in line and not in_php and not is_default:
+                c_headers.append(s.rstrip(";"))
+            elif in_php and not is_default:
+                if f"add_header Alt-Svc '{ALT_SVC}'" in line:
+                    c_php_adds.append(s.rstrip(";"))
+                elif "fastcgi_param HTTP_HOST $host;" in line:
+                    c_php_adds.append(s.rstrip(";"))
+            if "location ~ \\.php$" in s and not is_default:
+                in_php = True
+            elif in_php and s == "}":
+                in_php = False
+
+        php_match = (set(c_php_adds) == set(t_php_adds)) if (not is_default and has_php) else (len(t_php_adds) == 0)
+
+        if (set(c_listeners) == set(t_listeners) and
+                set(c_directives) == set(t_directives) and
+                set(c_headers) == set(t_headers) and
+                php_match):
+            continue
+
+        # Rebuild
+        new_lines       = []
+        listeners_added = False
+        directives_added = False
+        in_php           = False
+
+        for i, line in enumerate(lines):
+            s = line.strip()
+
+            if s.startswith("listen ") and not s.startswith("#"):
+                if any(p in s for p in ["80", "443"]):
+                    continue
+
+            elif s in ["http2 on;", "http3 on;"]:
+                continue
+
+            elif f"add_header Alt-Svc '{ALT_SVC}'" in line:
+                continue
+
+            elif "fastcgi_param HTTP_HOST $host;" in line:
+                continue
+
+            elif "server {" in line and not listeners_added:
+                new_lines.append(line)
+                base = "    "
+                for j in range(i + 1, min(i + 10, len(lines))):
+                    nxt = lines[j]
+                    if nxt.strip() and not nxt.strip().startswith("#"):
+                        base = nxt[: len(nxt) - len(nxt.lstrip())]
+                        break
+                for l in t_listeners:
+                    new_lines.append(f"{base}{l};\n")
+                listeners_added = True
+                continue
+
+            elif s.startswith("server_name") and not directives_added:
+                new_lines.append(line)
+                base = _indent(lines, i)
+                for d in t_directives:
+                    new_lines.append(f"{base}{d};\n")
+                if not is_default:
+                    for h in t_headers:
+                        new_lines.append(f"{base}{h};\n")
+                directives_added = True
+                continue
+
+            elif "location ~ \\.php$" in s and not is_default and t_php_adds:
+                new_lines.append(line)
+                php_ind = _php_indent(lines, i)
+                for a in t_php_adds:
+                    new_lines.append(f"{php_ind}{a};\n")
+                continue
+
+            else:
+                new_lines.append(line)
+
+        try:
+            cf.write_text("".join(new_lines))
+            action = "enabled" if http3 else "disabled"
+            logger.warning(f"http3_enable: {action} — updated {filename}")
+            any_changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
+
+    return any_changed
+
+
+# ---------------------------------------------------------------------------
+# apply_quic_gso_enable
+# ---------------------------------------------------------------------------
+
+def apply_quic_gso_enable(config, logger):
+    features      = config.get("nginx", {}).get("features", {})
+    effective     = features.get("quic_gso_enable", False) and features.get("http3_enable", False)
+    conf_files    = _site_confs()
+    any_changed   = False
+
+    for cf in conf_files:
+        filename = cf.name
+
+        try:
+            lines = cf.read_text().splitlines(keepends=True)
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            continue
+
+        has_gso = any(l.strip() == "quic_gso on;" for l in lines)
+        if has_gso == effective:
+            continue
+
+        new_lines   = []
+        gso_added   = False
+
+        for i, line in enumerate(lines):
+            s = line.strip()
+
+            if s == "quic_gso on;" and not effective:
+                continue
+            elif s.startswith("server_name") and not s.startswith("#") and effective and not gso_added:
+                new_lines.append(line)
+                new_lines.append(f"{_indent(lines, i)}quic_gso on;\n")
+                gso_added = True
+                continue
+            else:
+                new_lines.append(line)
+
+        try:
+            cf.write_text("".join(new_lines))
+            action = "enabled" if effective else "disabled"
+            logger.warning(f"quic_gso_enable: {action} — updated {filename}")
+            any_changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
+
+    return any_changed
+
+
+# ---------------------------------------------------------------------------
+# apply_include_features
+# ---------------------------------------------------------------------------
+
+def apply_include_features(config, logger):
+    features = config.get("nginx", {}).get("features", {})
+
+    include_map = {
+        "ssl_upgrade":      f"include {OVERRIDES}/ssl.conf",
+        "server_hardening": f"include {OVERRIDES}/hardening.conf",
+        "cms_protection":   f"include {OVERRIDES}/cms.conf",
+    }
+
+    expected = [v for k, v in include_map.items() if features.get(k, False)]
+    manageable = list(include_map.values())
+
+    conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
+    any_changed = False
+
+    for cf in conf_files:
+        filename = cf.name
+
+        try:
+            lines = cf.read_text().splitlines(keepends=True)
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            continue
+
+        current  = []
+        unwanted = []
+        managed_filenames = {Path(v).name for v in manageable}
+
+        for line in lines:
+            s = line.strip()
+            if not s.startswith("include "):
+                continue
+            inc_filename = Path(s.rstrip(";").split()[-1]).name
+            if inc_filename not in managed_filenames:
+                continue
+            canonical = next(v for v in manageable if Path(v).name == inc_filename)
+            if s.rstrip(";") == canonical:
+                current.append(canonical)
+            else:
+                unwanted.append(s.rstrip(";"))
+
+        to_add    = [i for i in expected if i not in current]
+        to_remove = [i for i in manageable if i in current and i not in expected]
+
+        if not to_add and not to_remove and not unwanted:
+            continue
+
+        new_lines        = []
+        includes_written = False
+
+        for i, line in enumerate(lines):
+            s = line.strip()
+
+            skip = False
+            for inc in to_remove + unwanted:
+                if s == f"{inc};" or s == inc:
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            new_lines.append(line)
+
+            if "include vhost_includes/" in line and not includes_written:
+                base = _indent(lines, i)
+                for inc in to_add:
+                    new_lines.append(f"{base}{inc};\n")
+                includes_written = True
+
+        try:
+            cf.write_text("".join(new_lines))
+            parts = []
+            if to_add:
+                parts.append(f"added {', '.join(k for k,v in include_map.items() if v in to_add)}")
+            if to_remove:
+                parts.append(f"removed {', '.join(k for k,v in include_map.items() if v in to_remove)}")
+            if unwanted:
+                parts.append(f"cleaned {len(unwanted)} legacy includes")
+            logger.warning(f"include_features: {'; '.join(parts)} — {filename}")
+            any_changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
+
+    return any_changed
+
+
+# ---------------------------------------------------------------------------
+# apply_logging_features
+# ---------------------------------------------------------------------------
+
+def apply_logging_features(config, logger):
+    features    = config.get("nginx", {}).get("features", {})
+    pers_on     = features.get("persistent_logging", False)
+    realip_on   = features.get("real_ip_logging", False)
+
+    conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
+    any_changed = False
+
+    for cf in conf_files:
+        filename = cf.name
+
+        try:
+            lines = cf.read_text().splitlines(keepends=True)
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            continue
+
+        has_pers_log    = False
+        has_pers_fmt    = False
+        has_realip_map  = False
+        has_realip_fmt  = False
+        uuid            = None
+
+        for line in lines:
+            s = line.strip()
+            if ("access_log /var/log/nginx/" in s or
+                    ("access_log /var/www/" in s and "/logs/webserver.log" in s)):
+                has_pers_log = True
+            elif "log_format" in s and "_persistent" in s:
+                has_pers_fmt = True
+            elif "map $http_cf_connecting_ip $actual_addr" in s:
+                has_realip_map = True
+            elif "log_format" in s and "$actual_addr" in s and "_persistent" not in s:
+                has_realip_fmt = True
+            elif "access_log /var/local/enhance/webserver_logs/" in s:
+                try:
+                    parts = s.split()
+                    if len(parts) >= 3:
+                        uuid = parts[1].split("/")[-1].replace(".log", "")
+                except Exception:
+                    pass
+
+        cur_pers   = has_pers_log and has_pers_fmt
+        cur_realip = has_realip_map and has_realip_fmt
+
+        # Directory / ownership checks
+        needs_dir   = False
+        needs_chown = False
+        if uuid and pers_on:
+            logs_dir = Path(f"/var/www/{uuid}/logs")
+            if not logs_dir.exists():
+                needs_dir = True
+            else:
+                try:
+                    parent_stat = os.stat(f"/var/www/{uuid}")
+                    for lf in logs_dir.iterdir():
+                        if lf.is_file():
+                            fs = os.stat(lf)
+                            if fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid:
+                                needs_chown = True
+                                break
+                except Exception:
+                    pass
+
+        if (cur_pers == pers_on and
+                cur_realip == realip_on and
+                not needs_dir and not needs_chown):
+            continue
+
+        # Fix directories and ownership first
+        if uuid and pers_on:
+            _ensure_log_dir(uuid, logger)
+
+        # Rebuild config
+        new_lines       = []
+        realip_added    = False
+        pers_added      = False
+        pers_fmt_added  = False
+
+        for i, line in enumerate(lines):
+            s    = line.strip()
+            base = _indent(lines, i)
+
+            # Remove real IP map when disabling
+            if not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
+                continue
+
+            # Remove persistent log line when disabling
+            elif (not pers_on and
+                  ("access_log /var/log/nginx/" in s or
+                   ("access_log /var/www/" in s and "/logs/webserver.log" in s))):
+                continue
+
+            # Remove persistent log format when disabling
+            elif not pers_on and "log_format" in s and "_persistent" in s:
+                continue
+
+            # Update original log_format line for real IP
+            elif "log_format" in s and "_persistent" not in s:
+                if realip_on and "$remote_addr" in s:
+                    new_lines.append(line.replace("$remote_addr", "$actual_addr"))
+                elif not realip_on and "$actual_addr" in s:
+                    new_lines.append(line.replace("$actual_addr", "$remote_addr"))
+                else:
+                    new_lines.append(line)
+
+                # Append persistent format after original format
+                if pers_on and not pers_fmt_added and not has_pers_fmt:
+                    try:
+                        parts = s.split()
+                        if len(parts) >= 2:
+                            fmt_name = parts[1]
+                            pers_fmt = (
+                                f"log_format {fmt_name}_persistent "
+                                f"'$time_local - $actual_addr - $http_cf_ipcountry - "
+                                f"$server_protocol - $status - $request_method - "
+                                f"$host - $request_uri - $http_user_agent - "
+                                f"$upstream_cache_status - $request_time - "
+                                f"$upstream_response_time';\n"
+                            )
+                            new_lines.append(pers_fmt)
+                            pers_fmt_added = True
+                    except Exception:
+                        pass
+                continue
+
+            # Insert real IP map before fastcgi_cache_path
+            elif (s.startswith("fastcgi_cache_path") and realip_on
+                  and not realip_added and not has_realip_map):
+                new_lines.append(
+                    "map $http_cf_connecting_ip $actual_addr "
+                    "{ default $http_cf_connecting_ip; \"\" $remote_addr; }\n"
+                )
+                new_lines.append(line)
+                realip_added = True
+                continue
+
+            # Insert persistent log line after enhance access_log
+            elif ("access_log /var/local/enhance/webserver_logs/" in s
+                  and pers_on and not pers_added):
+                new_lines.append(line)
+                try:
+                    parts = s.split()
+                    if len(parts) >= 3:
+                        log_path   = parts[1]
+                        log_fmt    = parts[2].rstrip(";")
+                        file_uuid  = log_path.split("/")[-1].replace(".log", "")
+                        _ensure_log_dir(file_uuid, logger)
+                        new_lines.append(
+                            f"{base}access_log /var/www/{file_uuid}/logs/webserver.log "
+                            f"{log_fmt}_persistent;\n"
+                        )
+                        pers_added = True
+                except Exception:
+                    pass
+                continue
+
+            else:
+                new_lines.append(line)
+
+        try:
+            cf.write_text("".join(new_lines))
+            parts = []
+            if cur_pers != pers_on:
+                parts.append(f"persistent logging {'enabled' if pers_on else 'disabled'}")
+            if cur_realip != realip_on:
+                parts.append(f"real IP logging {'enabled' if realip_on else 'disabled'}")
+            logger.warning(f"logging_features: {'; '.join(parts)} — {filename}")
+            any_changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
+
+    return any_changed
+
+
+def _ensure_log_dir(uuid, logger):
+    logs_dir = Path(f"/var/www/{uuid}/logs")
+    try:
+        if not logs_dir.exists():
+            logs_dir.mkdir(parents=True, mode=0o755)
+            parent_stat = os.stat(f"/var/www/{uuid}")
+            os.chown(logs_dir, parent_stat.st_uid, parent_stat.st_gid)
+
+        parent_stat = os.stat(f"/var/www/{uuid}")
+        for lf in logs_dir.iterdir():
+            if lf.is_file():
+                fs = os.stat(lf)
+                if fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid:
+                    os.chown(lf, parent_stat.st_uid, parent_stat.st_gid)
+                    os.chmod(lf, 0o644)
+    except Exception as e:
+        logger.error(f"Failed to set up log directory for {uuid}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# apply_fastcgi_cache_settings
+# ---------------------------------------------------------------------------
+
+def apply_fastcgi_cache_settings(config, logger):
+    features    = config.get("nginx", {}).get("features", {})
+    cfg_inactive = features.get("fastcgi_cache_inactive", "60m")
+    cfg_valid    = features.get("fastcgi_cache_valid", "60m")
+
+    conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
+    any_changed = False
+
+    for cf in conf_files:
+        filename = cf.name
+
+        try:
+            lines = cf.read_text().splitlines(keepends=True)
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            continue
+
+        cur_inactive = None
+        cur_valid    = None
+
+        for line in lines:
+            s = line.strip()
+            if s.startswith("fastcgi_cache_path"):
+                m = re.search(r"inactive=([^;\s]+)", line)
+                if m:
+                    cur_inactive = m.group(1)
+            elif s.startswith("fastcgi_cache_valid"):
+                m = re.search(r"fastcgi_cache_valid\s+([^;\s]+)", line)
+                if m:
+                    cur_valid = m.group(1)
+
+        inactive_change = cur_inactive and cur_inactive != cfg_inactive
+        valid_change    = cur_valid and cur_valid != cfg_valid
+
+        if not inactive_change and not valid_change:
+            continue
+
+        new_lines = []
+        for line in lines:
+            s = line.strip()
+            if s.startswith("fastcgi_cache_path") and inactive_change:
+                new_lines.append(re.sub(r"inactive=[^;\s]+", f"inactive={cfg_inactive}", line))
+            elif s.startswith("fastcgi_cache_valid") and valid_change:
+                new_lines.append(re.sub(r"fastcgi_cache_valid\s+[^;\s]+",
+                                        f"fastcgi_cache_valid {cfg_valid}", line))
+            else:
+                new_lines.append(line)
+
+        try:
+            cf.write_text("".join(new_lines))
+            logger.warning(f"fastcgi_cache_settings: updated {filename}")
+            any_changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
+
+    return any_changed
+
+
+# ---------------------------------------------------------------------------
+# apply_client_max_body_size
+# ---------------------------------------------------------------------------
+
+def apply_client_max_body_size(config, logger):
+    features     = config.get("nginx", {}).get("features", {})
+    cfg_size     = features.get("client_max_body_size", "200m")
+
+    conf_files   = _site_confs()
+    is_cp_server = any(f.name.startswith("000-") for f in conf_files)
+    conf_files   = [f for f in conf_files if f.name != "default.conf"]
+    any_changed  = False
+
+    for cf in conf_files:
+        filename = cf.name
+
+        try:
+            lines = cf.read_text().splitlines(keepends=True)
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            continue
+
+        content   = "".join(lines)
+        is_cp     = is_cp_server and 'root "/var/www/control-panel/ui"' in content
+
+        if is_cp:
+            needs_change   = False
+            in_loc         = False
+            for line in lines:
+                s = line.strip()
+                if s.startswith("location ") and "{" in s:
+                    in_loc = True
+                elif in_loc and s == "}":
+                    in_loc = False
+                elif s.startswith("client_max_body_size"):
+                    m = re.search(r"client_max_body_size\s+([^;\s]+)", line)
+                    if m:
+                        expected = "0" if in_loc else "2000m"
+                        if m.group(1) != expected:
+                            needs_change = True
+                            break
+
+            if not needs_change:
+                continue
+
+            new_lines = []
+            in_loc    = False
+            for line in lines:
+                s = line.strip()
+                if s.startswith("location ") and "{" in s:
+                    in_loc = True
+                elif in_loc and s == "}":
+                    in_loc = False
+                if s.startswith("client_max_body_size"):
+                    target = "0" if in_loc else "2000m"
+                    new_lines.append(re.sub(r"client_max_body_size\s+[^;\s]+",
+                                            f"client_max_body_size {target}", line))
+                else:
+                    new_lines.append(line)
+
+            try:
+                cf.write_text("".join(new_lines))
+                logger.warning(f"client_max_body_size: restored control panel values — {filename}")
+                any_changed = True
+            except Exception as e:
+                logger.error(f"Failed to write {filename}: {e}")
+
+        else:
+            cur_size = None
+            for line in lines:
+                s = line.strip()
+                if s.startswith("client_max_body_size"):
+                    m = re.search(r"client_max_body_size\s+([^;\s]+)", line)
+                    if m:
+                        cur_size = m.group(1)
+                        break
+
+            if not cur_size or cur_size == cfg_size:
+                continue
+
+            new_lines = []
+            for line in lines:
+                s = line.strip()
+                if s.startswith("client_max_body_size"):
+                    new_lines.append(re.sub(r"client_max_body_size\s+[^;\s]+",
+                                            f"client_max_body_size {cfg_size}", line))
+                else:
+                    new_lines.append(line)
+
+            try:
+                cf.write_text("".join(new_lines))
+                logger.warning(f"client_max_body_size: set to {cfg_size} — {filename}")
+                any_changed = True
+            except Exception as e:
+                logger.error(f"Failed to write {filename}: {e}")
+
+    return any_changed
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _site_confs():
+    try:
+        return [f for f in SITES_DIR.glob("*.conf") if not f.name.startswith("000-")]
+    except Exception:
+        return []

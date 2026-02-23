@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+webservertune-enhance
+Detects the active webserver and starts the appropriate modules.
+Monitors for webserver changes and restarts via systemd if detected.
+"""
+
+import importlib.util
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+BASE_DIR    = Path("/opt/webservertune-enhance")
+CONFIG_FILE = BASE_DIR / "settings.conf"
+LOG_DIR     = Path("/var/log/webservertune-enhance")
+MODULES_DIR = BASE_DIR / "modules"
+
+DETECT_INTERVAL = 30
+
+
+def load_config():
+    try:
+        import tomllib
+    except ImportError:
+        print("ERROR: tomllib not available. Requires Python 3.11+", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: Config file not found: {CONFIG_FILE}", file=sys.stderr)
+        sys.exit(1)
+    except tomllib.TOMLDecodeError as e:
+        print(f"ERROR: Failed to parse config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def setup_logger(name, log_level):
+    log_file = LOG_DIR / f"{name}.log"
+    logger   = logging.getLogger(name)
+    level    = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(level)
+
+    if not logger.handlers:
+        fmt = logging.Formatter(
+            "%(asctime)s %(levelname).1s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+
+    return logger
+
+
+def is_active(service):
+    result = subprocess.run(
+        ["systemctl", "is-active", service],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip() in ("active", "reloading", "activating", "deactivating")
+
+
+def detect_webserver():
+    if is_active("nginx"):
+        return "nginx"
+    if is_active("lshttpd"):
+        return "ols"
+    return None
+
+
+def load_module(name):
+    from importlib.machinery import SourceFileLoader
+    path   = MODULES_DIR / name
+    loader = SourceFileLoader(name, str(path))
+    spec   = importlib.util.spec_from_loader(name, loader)
+    mod    = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def main():
+    if os.geteuid() != 0:
+        print("ERROR: Must be run as root", file=sys.stderr)
+        sys.exit(1)
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    config    = load_config()
+    log_level = config.get("general", {}).get("log_level", "WARNING")
+    logger    = setup_logger("webservertune-enhance", log_level)
+
+    logger.info("webservertune-enhance starting")
+
+    webserver = detect_webserver()
+    if webserver is None:
+        logger.error("No supported webserver detected (nginx or lshttpd). Exiting.")
+        sys.exit(1)
+
+    logger.info(f"Detected webserver: {webserver}")
+
+    if webserver == "nginx":
+        nginxtune    = load_module("nginxtune")
+        nginx_logger = setup_logger("nginxtune", log_level)
+
+        t = threading.Thread(
+            target=nginxtune.watch,
+            args=(config, nginx_logger),
+            daemon=True
+        )
+        t.start()
+
+    elif webserver == "ols":
+        olstune    = load_module("olstune")
+        ols503fix  = load_module("ols503fix")
+        ols_logger = setup_logger("olstune", log_level)
+        fix_logger = setup_logger("ols503fix", log_level)
+
+        t1 = threading.Thread(
+            target=olstune.watch,
+            args=(config, ols_logger),
+            daemon=True
+        )
+        t1.start()
+
+        t2 = threading.Thread(
+            target=ols503fix.run,
+            args=(config, fix_logger),
+            daemon=True
+        )
+        t2.start()
+
+    def watch_config():
+        cmd = [
+            "inotifywait", "--monitor", "--quiet",
+            "--format", "%e %f",
+            "--event", "modify",
+            "--event", "create",
+            "--event", "moved_to",
+            str(CONFIG_FILE.parent),
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
+            return
+        for line in proc.stdout:
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2 and parts[1] == CONFIG_FILE.name:
+                logger.warning("settings.conf changed, exiting for systemd restart")
+                logging.shutdown()
+                os._exit(0)
+
+    threading.Thread(target=watch_config, daemon=True).start()
+
+    while True:
+        time.sleep(DETECT_INTERVAL)
+        current = detect_webserver()
+        if current != webserver:
+            logger.warning(
+                f"Webserver changed from {webserver} to {current or 'none'}. "
+                "Exiting for systemd restart."
+            )
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -136,7 +136,7 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 
 ## Backup System
 
-- **Location**: `/opt/webservertune-enhance/backups/nginx/YYYYMMDD_HHMMSS/` and `backups/ols/`
+- **Location**: `/opt/webservertune-enhance/backups/`
 - **Validation**: Tests Nginx configuration with `nginx -t` before applying changes
 - **Rollback**: Restores from backup and reloads if validation or reload fails, then restarts the service to re-attempt
 - **Retention**: Configurable per webserver (default 30 days)
@@ -152,11 +152,11 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 | `olstune.log` | OLS config enforcement, backups, restarts |
 | `ols503fix.log` | 503 detection events and PHP restart actions |
 
-`INFO` is the recommended log level. `DEBUG` adds low-level inotify event detail. `WARNING` shows only unexpected events and errors.
+`INFO` is the recommended log level. `DEBUG` adds low-level inotify event detail.
 
 ### Persistent Logging
 
-When `persistent_logging` is enabled, access logs are also written to `/var/www/<UUID>/logs/webserver.log` using an extended log format. When `real_ip_logging` is also enabled, Cloudflare visitor IPs are logged instead of edge server IPs.
+When `persistent_logging` is enabled for Nginx, access logs are also written to `/var/www/<UUID>/logs/webserver.log` using an extended log format. When `real_ip_logging` is also enabled, Cloudflare visitor IPs are logged instead of edge server IPs.
 
 ### Log Rotation
 

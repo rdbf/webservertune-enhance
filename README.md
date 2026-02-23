@@ -175,6 +175,8 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 }
 
 /var/www/*/logs/webserver.log
+/var/log/nginx/error.log
+/var/log/nginx/access.log
 {
    rotate 15
    weekly

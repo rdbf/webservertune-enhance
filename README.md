@@ -114,6 +114,35 @@ When `persistent_logging` is enabled under `[nginx-features]`:
 - Uses a modified log format with additional fields
 - Real visitor IPs are logged when `real_ip_logging` is enabled (extracts Cloudflare visitor IPs instead of edge server IPs)
 
+### Log Rotation
+When rotating the logs with Logrotate is desired, create a file called `/etc/logrotate.d/webservertune-enhance` and add the following lines:
+```
+/var/log/webservertune-enhance/*.log
+{
+   rotate 15
+   weekly
+   missingok
+   notifempty
+   compress
+   delaycompress
+   copytruncate
+}
+
+/var/www/*/logs/webserver.log
+{
+   rotate 15
+   weekly
+   missingok
+   notifempty
+   compress
+   delaycompress
+   postrotate
+      nginx -s reopen
+   endscript
+}
+```
+With this logrotate config, all service logs in `/var/log/webservertune-enhance/` and all persistent access logs in `/var/www/*/logs/` will be rotated and compressed weekly and will be retained for 15 weeks.
+
 ## Backup System
 
 - **Automatic Backups**: Creates timestamped backups of all site configs before any changes

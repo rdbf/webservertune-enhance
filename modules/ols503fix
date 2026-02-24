@@ -68,6 +68,8 @@ class SiteState:
         self.errors_503     = deque()
         self.errors_503_24h = deque()
         self.last_restart   = 0.0
+        self._domain        = None
+        self._domain_ts     = 0.0
 
     def record(self, status_code):
         now = time.time()
@@ -134,6 +136,17 @@ class SiteState:
         self.last_restart = time.time()
         self.all_requests.clear()
         self.errors_503.clear()
+
+    def get_domain(self, config, logger):
+        now = time.time()
+        if self._domain is not None and now - self._domain_ts < 300:
+            logger.debug(f"[{self.website_id}] Using cached domain: {self._domain}")
+            return self._domain
+        domain = _get_primary_domain(self.website_id, config, logger)
+        if domain is not None:
+            self._domain    = domain
+            self._domain_ts = now
+        return domain
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +272,7 @@ class SiteRegistry:
                     f"{self.config.get('window_seconds', 30)}s window, "
                     f"{pct:.0f}% of last {self.config.get('last_n_requests', 10)} requests"
                 )
-                domain = _get_primary_domain(wid, self.config, self.logger)
+                domain = state.get_domain(self.config, self.logger)
                 if domain is not None:
                     probe = _probe_site(domain, self.logger)
                     if probe is not None and probe != 503:
@@ -286,17 +299,20 @@ def _get_primary_domain(website_id, config, logger):
     if not org_id:
         logger.warning(f"[{website_id}] enhance_org_id not set — skipping domain probe")
         return None
-    url     = f"{config.get('enhance_url', '').rstrip('/')}/api/orgs/{org_id}/websites/{website_id}/domains"
+    url     = f"{config.get('enhance_url', '').rstrip('/')}/orgs/{org_id}/websites/{website_id}/domains"
     headers = {"Authorization": f"Bearer {config.get('enhance_token', '')}"}
+    logger.debug(f"[{website_id}] Domain lookup URL: {url}")
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code != 200:
-            logger.warning(f"[{website_id}] Domain lookup returned {resp.status_code} — skipping probe")
+            logger.warning(f"[{website_id}] Domain lookup returned {resp.status_code} for {url} — skipping probe")
             return None
         items = resp.json().get("items", [])
         for item in items:
             if item.get("mappingKind") == "primary":
-                return item.get("domain")
+                domain = item.get("domain")
+                logger.debug(f"[{website_id}] Primary domain found: {domain}")
+                return domain
         logger.warning(f"[{website_id}] No primary domain found — skipping probe")
         return None
     except requests.RequestException as e:

@@ -255,10 +255,20 @@ class SiteRegistry:
             trigger, total, errors, pct = state.should_restart(self.logger)
             if trigger:
                 self.logger.info(
-                    f"[{wid}] Restarting PHP — {errors} x 503 in "
+                    f"[{wid}] Thresholds met — {errors} x 503 in "
                     f"{self.config.get('window_seconds', 30)}s window, "
                     f"{pct:.0f}% of last {self.config.get('last_n_requests', 10)} requests"
                 )
+                domain = _get_primary_domain(wid, self.config, self.logger)
+                if domain is not None:
+                    probe = _probe_site(domain, self.logger)
+                    if probe is not None and probe != 503:
+                        self.logger.info(
+                            f"[{wid}] Probe of {domain} returned {probe} — "
+                            f"site is responding normally, skipping restart"
+                        )
+                        continue
+                self.logger.info(f"[{wid}] Restarting PHP")
                 success = _restart_php(wid, self.config, self.logger)
                 state.mark_restarted()
                 if success:
@@ -270,6 +280,40 @@ class SiteRegistry:
 # ---------------------------------------------------------------------------
 # Enhance API
 # ---------------------------------------------------------------------------
+
+def _get_primary_domain(website_id, config, logger):
+    org_id = config.get("enhance_org_id", "")
+    if not org_id:
+        logger.warning(f"[{website_id}] enhance_org_id not set — skipping domain probe")
+        return None
+    url     = f"{config.get('enhance_url', '').rstrip('/')}/api/orgs/{org_id}/websites/{website_id}/domains"
+    headers = {"Authorization": f"Bearer {config.get('enhance_token', '')}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"[{website_id}] Domain lookup returned {resp.status_code} — skipping probe")
+            return None
+        items = resp.json().get("items", [])
+        for item in items:
+            if item.get("mappingKind") == "primary":
+                return item.get("domain")
+        logger.warning(f"[{website_id}] No primary domain found — skipping probe")
+        return None
+    except requests.RequestException as e:
+        logger.warning(f"[{website_id}] Domain lookup failed: {e} — skipping probe")
+        return None
+
+
+def _probe_site(domain, logger):
+    url = f"https://{domain}"
+    try:
+        resp = requests.get(url, timeout=10, allow_redirects=True)
+        logger.debug(f"Probe {url} returned {resp.status_code}")
+        return resp.status_code
+    except requests.RequestException as e:
+        logger.warning(f"Probe {url} failed: {e}")
+        return None
+
 
 def _restart_php(website_id, config, logger):
     url     = f"{config.get('enhance_url', '').rstrip('/')}/v2/websites/{website_id}/restart_php"

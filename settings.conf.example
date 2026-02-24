@@ -54,6 +54,7 @@ backup_retention_days = 30
 
 [ols-503fix]
 enhance_url      = "https://example.com/api"
+enhance_org_id   = ""
 enhance_token    = ""
 window_seconds   = 30
 min_503_count    = 5

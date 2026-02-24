@@ -126,6 +126,7 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enhance_url` | — | Enhance panel API URL |
+| `enhance_org_id` | — | Enhance organisation UUID |
 | `enhance_token` | — | Enhance API bearer token |
 | `window_seconds` | `30` | Sliding window in seconds for 503 counting |
 | `min_503_count` | `5` | Minimum 503 count within the window before evaluating a restart |

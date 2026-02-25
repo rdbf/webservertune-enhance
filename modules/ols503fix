@@ -324,7 +324,7 @@ def _probe_site(domain, logger):
     import random
     url = f"https://{domain}/?probe={random.randint(1, 999999)}"
     try:
-        resp = requests.get(url, timeout=10, allow_redirects=True)
+        resp = requests.get(url, timeout=3, allow_redirects=True)
         logger.debug(f"Probe {url} returned {resp.status_code}")
         return resp.status_code
     except requests.RequestException as e:

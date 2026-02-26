@@ -193,4 +193,5 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 ## Version History
 
 **0.2.0** — Persistent webserver/php logging for OLS/Nginx.
+
 **0.1.0** — Initial release, merging nginx/ols/503 scripts, logs, and configs.

@@ -3,6 +3,9 @@
 [general]
 log_level = "INFO"
 debounce_seconds = 10
+persistent_logging = false
+persistent_php_logs = false
+ols_503fix_enable = false
 
 
 [nginx]
@@ -14,7 +17,6 @@ quic_gso_enable = false
 ssl_upgrade = false
 server_hardening = false
 cms_protection = false
-persistent_logging = false
 real_ip_logging = false
 fastcgi_cache_inactive = "60m"
 fastcgi_cache_valid = "60m"

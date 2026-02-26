@@ -119,23 +119,27 @@ def main():
 
     elif webserver == "ols":
         olstune    = load_module("olstune")
-        ols503fix  = load_module("ols503fix")
         ols_logger = setup_logger("olstune", log_level)
-        fix_logger = setup_logger("ols503fix", log_level)
+
+        site_watcher = olstune.OLSSiteWatcher(ols_logger)
+        site_watcher.start()
 
         t1 = threading.Thread(
             target=olstune.watch,
-            args=(config, ols_logger),
+            args=(config, ols_logger, site_watcher),
             daemon=True
         )
         t1.start()
 
-        t2 = threading.Thread(
-            target=ols503fix.run,
-            args=(config, fix_logger),
-            daemon=True
-        )
-        t2.start()
+        if config.get("general", {}).get("ols_503fix_enable", False):
+            ols503fix  = load_module("ols503fix")
+            fix_logger = setup_logger("ols503fix", log_level)
+            t2 = threading.Thread(
+                target=ols503fix.run,
+                args=(config, fix_logger, site_watcher),
+                daemon=True
+            )
+            t2.start()
 
     def watch_config():
         cmd = [

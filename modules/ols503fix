@@ -3,10 +3,11 @@
 ols503fix
 Monitors per-site webserver logs and restarts PHP via the Enhance API
 when 503 error thresholds are exceeded.
-Called by webservertune-enhance orchestrator.
+Called by webservertune-enhance main program.
 """
 
 import re
+import threading
 import time
 from collections import deque
 
@@ -20,7 +21,7 @@ LOG_PATTERN = re.compile(r'"([^"]*)"')
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run(config, logger):
+def run(config, logger, site_watcher):
     cfg = config.get("ols-503fix", {})
 
     logger.info(
@@ -31,13 +32,10 @@ def run(config, logger):
         f"cooldown={cfg.get('cooldown_seconds', 60)}s"
     )
 
-    registry    = SiteRegistry(cfg, logger)
-    scan_count  = 0
+    registry = SiteRegistry(cfg, logger)
+    site_watcher.register_consumer(registry.add_site, registry.remove_site)
 
     while True:
-        if scan_count % 20 == 0:
-            registry.scan()
-        scan_count += 1
         registry.process()
         time.sleep(cfg.get("scan_interval", 1))
 
@@ -154,19 +152,21 @@ class SiteState:
 # ---------------------------------------------------------------------------
 
 class FileWatcher:
-    def __init__(self, path, logger):
-        self.path     = path
-        self.logger   = logger
-        self.fh       = None
-        self.inode    = None
-        self.position = 0
+    def __init__(self, path, logger, seek_to_end_on_open=True):
+        self.path                = path
+        self.logger              = logger
+        self.seek_to_end_on_open = seek_to_end_on_open
+        self.fh                  = None
+        self.inode               = None
+        self.position            = 0
         self._open()
 
     def _open(self):
         try:
-            self.fh       = open(self.path, "r", errors="replace")
-            self.inode    = __import__("os").fstat(self.fh.fileno()).st_ino
-            self.fh.seek(0, 2)
+            self.fh = open(self.path, "r", errors="replace")
+            self.inode = __import__("os").fstat(self.fh.fileno()).st_ino
+            if self.seek_to_end_on_open:
+                self.fh.seek(0, 2)
             self.position = self.fh.tell()
             self.logger.debug(f"Opened: {self.path} (inode {self.inode})")
         except OSError:
@@ -222,35 +222,35 @@ class SiteRegistry:
         self.logger   = logger
         self.watchers = {}
         self.states   = {}
+        self._lock    = threading.Lock()
 
-    def scan(self):
+    def add_site(self, wid):
         import os
-        try:
-            current = {
-                f[:-4]: __import__("os").path.join(LOG_DIR, f)
-                for f in os.listdir(LOG_DIR)
-                if f.endswith(".log")
-            }
-        except OSError as e:
-            self.logger.error(f"Cannot scan log directory {LOG_DIR}: {e}")
-            return
+        with self._lock:
+            if wid in self.watchers:
+                return
+            self.logger.debug(f"New site: {wid}")
+            path = os.path.join(LOG_DIR, f"{wid}.log")
+            self.watchers[wid] = FileWatcher(path, self.logger)
+            self.states[wid]   = SiteState(wid, self.config)
 
-        for wid, path in current.items():
+    def remove_site(self, wid):
+        with self._lock:
             if wid not in self.watchers:
-                self.logger.debug(f"New site: {wid}")
-                self.watchers[wid] = FileWatcher(path, self.logger)
-                self.states[wid]   = SiteState(wid, self.config)
-
-        for wid in list(self.watchers):
-            if wid not in current:
-                self.logger.debug(f"Site removed: {wid}")
-                self.watchers[wid].close()
-                del self.watchers[wid]
-                del self.states[wid]
+                return
+            self.logger.debug(f"Site removed: {wid}")
+            self.watchers[wid].close()
+            del self.watchers[wid]
+            del self.states[wid]
 
     def process(self):
-        for wid, watcher in list(self.watchers.items()):
-            state  = self.states[wid]
+        with self._lock:
+            snapshot = [
+                (wid, self.watchers[wid], self.states[wid])
+                for wid in list(self.watchers)
+            ]
+
+        for wid, watcher, state in snapshot:
             before = len(state.errors_503_24h)
 
             for line in watcher.readlines():

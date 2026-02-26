@@ -3,7 +3,7 @@
 nginxtune
 Nginx configuration management for Enhance hosting environments.
 Manages HTTP/3, security includes, logging, FastCGI cache and body size settings.
-Called by webservertune-enhance orchestrator.
+Called by webservertune-enhance main program.
 """
 
 import os
@@ -26,7 +26,7 @@ ALT_SVC      = 'h3=":443"; ma=86400'
 # ---------------------------------------------------------------------------
 
 def watch(config, logger):
-    """Entry point called by orchestrator. Runs startup check then watches for changes."""
+    """Entry point called by main program. Runs startup check then watches for changes."""
     logger.info("nginxtune starting")
 
     # Brief delay on startup to allow nginx to fully initialise before
@@ -34,6 +34,8 @@ def watch(config, logger):
     time.sleep(15)
 
     run(config, logger)
+
+    _start_php_log_thread(config, logger)
 
     cmd = [
         "inotifywait", "--monitor", "--quiet",
@@ -551,8 +553,9 @@ def apply_include_features(config, logger):
 # ---------------------------------------------------------------------------
 
 def apply_logging_features(config, logger):
+    general     = config.get("general", {})
     features    = config.get("nginx", {}).get("features", {})
-    pers_on     = features.get("persistent_logging", False)
+    pers_on     = general.get("persistent_logging", False)
     realip_on   = features.get("real_ip_logging", False)
 
     conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
@@ -736,10 +739,14 @@ def _ensure_log_dir(uuid, logger):
         parent_stat = os.stat(f"/var/www/{uuid}")
         for lf in logs_dir.iterdir():
             if lf.is_file():
-                fs = os.stat(lf)
-                if fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid:
-                    os.chown(lf, parent_stat.st_uid, parent_stat.st_gid)
-                    os.chmod(lf, 0o644)
+                fs          = os.stat(lf)
+                wrong_owner = fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid
+                wrong_perms = (fs.st_mode & 0o777) != 0o644
+                if wrong_owner or wrong_perms:
+                    if wrong_owner:
+                        os.chown(lf, parent_stat.st_uid, parent_stat.st_gid)
+                    if wrong_perms:
+                        os.chmod(lf, 0o644)
     except Exception as e:
         logger.error(f"Failed to set up log directory for {uuid}: {e}")
 
@@ -914,3 +921,226 @@ def _site_confs():
         return [f for f in SITES_DIR.glob("*.conf") if not f.name.startswith("000-")]
     except Exception:
         return []
+
+
+def _extract_uuid_from_conf(cf):
+    """Extract site UUID from the Enhance-generated access_log line in a conf file."""
+    try:
+        for line in cf.read_text().splitlines():
+            s = line.strip()
+            if "access_log /var/local/enhance/webserver_logs/" in s:
+                parts = s.split()
+                if len(parts) >= 2:
+                    return parts[1].split("/")[-1].replace(".log", "")
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# FileWatcher — tails a file, handles rotation and truncation
+# ---------------------------------------------------------------------------
+
+class FileWatcher:
+    def __init__(self, path, logger, seek_to_end_on_open=True):
+        self.path                = path
+        self.logger              = logger
+        self.seek_to_end_on_open = seek_to_end_on_open
+        self.fh                  = None
+        self.inode               = None
+        self.position            = 0
+        self._open()
+
+    def _open(self):
+        try:
+            self.fh = open(self.path, "r", errors="replace")
+            self.inode = os.fstat(self.fh.fileno()).st_ino
+            if self.seek_to_end_on_open:
+                self.fh.seek(0, 2)
+            self.position = self.fh.tell()
+            self.logger.debug(f"Opened: {self.path} (inode {self.inode})")
+        except OSError:
+            self.fh    = None
+            self.inode = None
+
+    def _reopen_if_needed(self):
+        try:
+            stat = os.stat(self.path)
+        except OSError:
+            if self.fh:
+                self.fh.close()
+                self.fh    = None
+                self.inode = None
+            return
+
+        if self.fh is None:
+            self._open()
+            return
+
+        if stat.st_ino != self.inode:
+            self.logger.debug(f"Recreated: {self.path}")
+            self.fh.close()
+            self._open()
+            return
+
+        if stat.st_size < self.position:
+            self.logger.debug(f"Truncated: {self.path}")
+            self.fh.seek(0)
+            self.position = 0
+
+    def readlines(self):
+        self._reopen_if_needed()
+        if self.fh is None:
+            return []
+        lines         = self.fh.readlines()
+        self.position = self.fh.tell()
+        return lines
+
+    def close(self):
+        if self.fh:
+            self.fh.close()
+
+
+# ---------------------------------------------------------------------------
+# _DestFile — keeps a destination log file handle open in append mode
+# ---------------------------------------------------------------------------
+
+class _DestFile:
+    def __init__(self, path, logger):
+        self.path   = path
+        self.logger = logger
+        self.fh     = None
+        self._open()
+
+    def _open(self):
+        try:
+            self.fh = open(self.path, "a")
+        except OSError as e:
+            self.logger.error(f"Cannot open dest file {self.path}: {e}")
+            self.fh = None
+
+    def write(self, line):
+        if self.fh is None:
+            self._open()
+            if self.fh is None:
+                return
+        try:
+            self.fh.write(line)
+            self.fh.flush()
+        except OSError:
+            self.fh = None
+            self._open()
+            if self.fh:
+                try:
+                    self.fh.write(line)
+                    self.fh.flush()
+                except OSError as e:
+                    self.logger.error(f"Failed to write to {self.path}: {e}")
+
+    def close(self):
+        if self.fh:
+            self.fh.close()
+            self.fh = None
+
+
+# ---------------------------------------------------------------------------
+# PHP log persistence
+# ---------------------------------------------------------------------------
+
+def _start_php_log_thread(config, logger):
+    """Start PHP log persistence thread if enabled."""
+    if not config.get("general", {}).get("persistent_php_logs", False):
+        return
+    t = threading.Thread(target=_php_log_watcher, args=(config, logger), daemon=True)
+    t.start()
+    logger.info("PHP log persistence thread started")
+
+
+def _php_log_watcher(config, logger):
+    """
+    Tails per-site php-error.log and php-fpm.log into /var/www/{uuid}/logs/php.log.
+    Site discovery via inotify on sites-enabled plus full scan at startup.
+    """
+    registry     = {}  # uuid -> {"error": FileWatcher, "fpm": FileWatcher, "dest": _DestFile}
+    fname_to_uuid = {}  # conf_filename -> uuid
+    reg_lock     = threading.Lock()
+
+    def register(uuid, conf_name):
+        if uuid in registry:
+            return
+        _ensure_log_dir(uuid, logger)
+        dest = _DestFile(Path(f"/var/www/{uuid}/logs/php.log"), logger)
+        registry[uuid] = {
+            "error": FileWatcher(f"/var/www/{uuid}/php-error.log", logger, seek_to_end_on_open=False),
+            "fpm":   FileWatcher(f"/var/www/{uuid}/php-fpm.log", logger, seek_to_end_on_open=False),
+            "dest":  dest,
+        }
+        fname_to_uuid[conf_name] = uuid
+        logger.debug(f"[php_log] Registered site: {uuid}")
+
+    def unregister_by_conf(conf_name):
+        uuid = fname_to_uuid.pop(conf_name, None)
+        if uuid is None:
+            return
+        entry = registry.pop(uuid, None)
+        if entry:
+            entry["error"].close()
+            entry["fpm"].close()
+            entry["dest"].close()
+            logger.debug(f"[php_log] Unregistered site: {uuid}")
+
+    # Startup scan
+    with reg_lock:
+        for cf in SITES_DIR.glob("*.conf"):
+            if cf.name.startswith("000-"):
+                continue
+            uuid = _extract_uuid_from_conf(cf)
+            if uuid:
+                register(uuid, cf.name)
+
+    # inotify watcher for site additions and removals
+    def inotify_loop():
+        cmd = [
+            "inotifywait", "--monitor", "--quiet",
+            "--format", "%e %f",
+            "--event", "create",
+            "--event", "delete",
+            str(SITES_DIR),
+        ]
+        while True:
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+            except Exception as e:
+                logger.error(f"[php_log] inotifywait failed: {e}")
+                time.sleep(5)
+                continue
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                event, fname = parts
+                if not fname.endswith(".conf") or fname.startswith("000-"):
+                    continue
+                if "CREATE" in event:
+                    cf = SITES_DIR / fname
+                    uuid = _extract_uuid_from_conf(cf)
+                    if uuid:
+                        with reg_lock:
+                            register(uuid, fname)
+                elif "DELETE" in event:
+                    with reg_lock:
+                        unregister_by_conf(fname)
+            proc.wait()
+            time.sleep(5)
+
+    threading.Thread(target=inotify_loop, daemon=True).start()
+
+    # Poll loop
+    while True:
+        with reg_lock:
+            for entry in registry.values():
+                for key in ("error", "fpm"):
+                    for line in entry[key].readlines():
+                        if line.strip():
+                            entry["dest"].write(line)
+        time.sleep(1)

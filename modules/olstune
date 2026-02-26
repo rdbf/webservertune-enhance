@@ -3,28 +3,113 @@
 olstune
 OpenLiteSpeed httpd_config.conf enforcer for Enhance hosting environments.
 Enforces key/value pairs defined in settings.conf whenever the file changes.
-Called by webservertune-enhance orchestrator.
+Called by webservertune-enhance main program.
 """
 
+import os
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 OLS_CONF    = Path("/usr/local/lsws/conf/httpd_config.conf")
+OLS_LOG_DIR = Path("/var/local/enhance/webserver_logs")
 BACKUP_BASE = Path("/opt/webservertune-enhance/backups/ols")
 OLS_RESTART = ["/usr/local/lsws/bin/lswsctrl", "restart"]
+
+
+# ---------------------------------------------------------------------------
+# OLS site watcher — single inotify for all OLS consumers
+# ---------------------------------------------------------------------------
+
+class OLSSiteWatcher:
+    def __init__(self, logger):
+        self._logger    = logger
+        self._lock      = threading.Lock()
+        self._known     = set()
+        self._consumers = []
+
+    def register_consumer(self, on_add, on_remove):
+        with self._lock:
+            self._consumers.append((on_add, on_remove))
+            known_snapshot = set(self._known)
+        for uuid in known_snapshot:
+            on_add(uuid)
+
+    def start(self):
+        try:
+            for f in OLS_LOG_DIR.iterdir():
+                if f.suffix == ".log":
+                    self._known.add(f.stem)
+        except OSError as e:
+            self._logger.error(f"[OLSSiteWatcher] Cannot scan {OLS_LOG_DIR}: {e}")
+
+        t = threading.Thread(target=self._inotify_loop, daemon=True)
+        t.start()
+        self._logger.info(f"[OLSSiteWatcher] Started, {len(self._known)} sites found")
+
+    def _fire_add(self, uuid):
+        with self._lock:
+            if uuid in self._known:
+                return
+            self._known.add(uuid)
+            consumers = list(self._consumers)
+        for on_add, _ in consumers:
+            on_add(uuid)
+
+    def _fire_remove(self, uuid):
+        with self._lock:
+            if uuid not in self._known:
+                return
+            self._known.discard(uuid)
+            consumers = list(self._consumers)
+        for _, on_remove in consumers:
+            on_remove(uuid)
+
+    def _inotify_loop(self):
+        cmd = [
+            "inotifywait", "--monitor", "--quiet",
+            "--format", "%e %f",
+            "--event", "create",
+            "--event", "delete",
+            str(OLS_LOG_DIR),
+        ]
+        while True:
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+            except Exception as e:
+                self._logger.error(f"[OLSSiteWatcher] inotifywait failed: {e}")
+                time.sleep(5)
+                continue
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                event, fname = parts
+                if not fname.endswith(".log"):
+                    continue
+                uuid = fname[:-4]
+                if "CREATE" in event:
+                    self._fire_add(uuid)
+                elif "DELETE" in event:
+                    self._fire_remove(uuid)
+            proc.wait()
+            self._logger.warning("[OLSSiteWatcher] inotifywait exited, restarting in 5s")
+            time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
 # inotify watch + debounce
 # ---------------------------------------------------------------------------
 
-def watch(config, logger):
-    """Entry point called by orchestrator. Runs startup check then watches for changes."""
+def watch(config, logger, site_watcher):
+    """Entry point called by main program. Runs startup check then watches for changes."""
     logger.info("olstune starting")
     run(config, logger)
+
+    _start_ols_log_threads(config, logger, site_watcher)
 
     watch_dir     = str(OLS_CONF.parent)
     debounce_secs = config.get("general", {}).get("debounce_seconds", 10)
@@ -53,7 +138,6 @@ def watch(config, logger):
             debounce_timer.start()
 
     def watch_loop():
-        import time
         while True:
             try:
                 logger.info(f"Watching {watch_dir} via inotifywait")
@@ -154,7 +238,7 @@ def _restart_ols(logger):
 
 
 # ---------------------------------------------------------------------------
-# Config enforcers (ported from settings-persist)
+# Config enforcers
 # ---------------------------------------------------------------------------
 
 def _enforce_general(lines, desired, logger):
@@ -292,3 +376,241 @@ def _enforce_block(lines, target_block, desired, logger):
         logger.warning(f"Block '{target_block}' not found in config")
 
     return new_lines, changed
+
+
+# ---------------------------------------------------------------------------
+# Log directory helper
+# ---------------------------------------------------------------------------
+
+def _ensure_log_dir(uuid, logger):
+    logs_dir = Path(f"/var/www/{uuid}/logs")
+    try:
+        if not logs_dir.exists():
+            logs_dir.mkdir(parents=True, mode=0o755)
+            parent_stat = os.stat(f"/var/www/{uuid}")
+            os.chown(logs_dir, parent_stat.st_uid, parent_stat.st_gid)
+
+        parent_stat = os.stat(f"/var/www/{uuid}")
+        for lf in logs_dir.iterdir():
+            if lf.is_file():
+                fs          = os.stat(lf)
+                wrong_owner = fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid
+                wrong_perms = (fs.st_mode & 0o777) != 0o644
+                if wrong_owner or wrong_perms:
+                    if wrong_owner:
+                        os.chown(lf, parent_stat.st_uid, parent_stat.st_gid)
+                    if wrong_perms:
+                        os.chmod(lf, 0o644)
+    except Exception as e:
+        logger.error(f"Failed to set up log directory for {uuid}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# FileWatcher — tails a file, handles rotation and truncation
+# ---------------------------------------------------------------------------
+
+class FileWatcher:
+    def __init__(self, path, logger, seek_to_end_on_open=True):
+        self.path                = path
+        self.logger              = logger
+        self.seek_to_end_on_open = seek_to_end_on_open
+        self.fh                  = None
+        self.inode               = None
+        self.position            = 0
+        self._open()
+
+    def _open(self):
+        try:
+            self.fh = open(self.path, "r", errors="replace")
+            self.inode = os.fstat(self.fh.fileno()).st_ino
+            if self.seek_to_end_on_open:
+                self.fh.seek(0, 2)
+            self.position = self.fh.tell()
+            self.logger.debug(f"Opened: {self.path} (inode {self.inode})")
+        except OSError:
+            self.fh    = None
+            self.inode = None
+
+    def _reopen_if_needed(self):
+        try:
+            stat = os.stat(self.path)
+        except OSError:
+            if self.fh:
+                self.fh.close()
+                self.fh    = None
+                self.inode = None
+            return
+
+        if self.fh is None:
+            self._open()
+            return
+
+        if stat.st_ino != self.inode:
+            self.logger.debug(f"Recreated: {self.path}")
+            self.fh.close()
+            self._open()
+            return
+
+        if stat.st_size < self.position:
+            self.logger.debug(f"Truncated: {self.path}")
+            self.fh.seek(0)
+            self.position = 0
+
+    def readlines(self):
+        self._reopen_if_needed()
+        if self.fh is None:
+            return []
+        lines         = self.fh.readlines()
+        self.position = self.fh.tell()
+        return lines
+
+    def close(self):
+        if self.fh:
+            self.fh.close()
+
+
+# ---------------------------------------------------------------------------
+# _DestFile — keeps a destination log file handle open in append mode
+# ---------------------------------------------------------------------------
+
+class _DestFile:
+    def __init__(self, path, logger):
+        self.path   = path
+        self.logger = logger
+        self.fh     = None
+        self._open()
+
+    def _open(self):
+        try:
+            self.fh = open(self.path, "a")
+        except OSError as e:
+            self.logger.error(f"Cannot open dest file {self.path}: {e}")
+            self.fh = None
+
+    def write(self, line):
+        if self.fh is None:
+            self._open()
+            if self.fh is None:
+                return
+        try:
+            self.fh.write(line)
+            self.fh.flush()
+        except OSError:
+            self.fh = None
+            self._open()
+            if self.fh:
+                try:
+                    self.fh.write(line)
+                    self.fh.flush()
+                except OSError as e:
+                    self.logger.error(f"Failed to write to {self.path}: {e}")
+
+    def close(self):
+        if self.fh:
+            self.fh.close()
+            self.fh = None
+
+
+# ---------------------------------------------------------------------------
+# OLS persistent log threads
+# ---------------------------------------------------------------------------
+
+def _start_ols_log_threads(config, logger, site_watcher):
+    """Start OLS log persistence threads if enabled."""
+    general = config.get("general", {})
+
+    if general.get("persistent_logging", False):
+        t = threading.Thread(
+            target=_ols_webserver_log_watcher,
+            args=(logger, site_watcher),
+            daemon=True
+        )
+        t.start()
+        logger.info("OLS webserver log persistence thread started")
+
+    if general.get("persistent_php_logs", False):
+        t = threading.Thread(
+            target=_ols_php_log_watcher,
+            args=(logger, site_watcher),
+            daemon=True
+        )
+        t.start()
+        logger.info("OLS PHP log persistence thread started")
+
+
+def _ols_webserver_log_watcher(logger, site_watcher):
+    """
+    Tails /var/local/enhance/webserver_logs/{uuid}.log into
+    /var/www/{uuid}/logs/webserver.log for each active OLS site.
+    """
+    registry = {}
+    reg_lock = threading.Lock()
+
+    def on_add(uuid):
+        with reg_lock:
+            if uuid in registry:
+                return
+            _ensure_log_dir(uuid, logger)
+            registry[uuid] = {
+                "src":  FileWatcher(str(OLS_LOG_DIR / f"{uuid}.log"), logger, seek_to_end_on_open=False),
+                "dest": _DestFile(Path(f"/var/www/{uuid}/logs/webserver.log"), logger),
+            }
+            logger.debug(f"[ols_webserver_log] Registered: {uuid}")
+
+    def on_remove(uuid):
+        with reg_lock:
+            entry = registry.pop(uuid, None)
+            if entry:
+                entry["src"].close()
+                entry["dest"].close()
+                logger.debug(f"[ols_webserver_log] Unregistered: {uuid}")
+
+    site_watcher.register_consumer(on_add, on_remove)
+
+    while True:
+        with reg_lock:
+            snapshot = list(registry.values())
+        for entry in snapshot:
+            for line in entry["src"].readlines():
+                if line.strip():
+                    entry["dest"].write(line)
+        time.sleep(1)
+
+
+def _ols_php_log_watcher(logger, site_watcher):
+    """
+    Tails /var/www/{uuid}/php-error.log into /var/www/{uuid}/logs/php.log
+    for each active OLS site. OLS does not produce php-fpm.log.
+    """
+    registry = {}
+    reg_lock = threading.Lock()
+
+    def on_add(uuid):
+        with reg_lock:
+            if uuid in registry:
+                return
+            _ensure_log_dir(uuid, logger)
+            registry[uuid] = {
+                "src":  FileWatcher(f"/var/www/{uuid}/php-error.log", logger, seek_to_end_on_open=False),
+                "dest": _DestFile(Path(f"/var/www/{uuid}/logs/php.log"), logger),
+            }
+            logger.debug(f"[ols_php_log] Registered: {uuid}")
+
+    def on_remove(uuid):
+        with reg_lock:
+            entry = registry.pop(uuid, None)
+            if entry:
+                entry["src"].close()
+                entry["dest"].close()
+                logger.debug(f"[ols_php_log] Unregistered: {uuid}")
+
+    site_watcher.register_consumer(on_add, on_remove)
+
+    while True:
+        with reg_lock:
+            snapshot = list(registry.values())
+        for entry in snapshot:
+            for line in entry["src"].readlines():
+                if line.strip():
+                    entry["dest"].write(line)
+        time.sleep(1)

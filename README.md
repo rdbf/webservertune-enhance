@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.1.0  
+**Version:** 0.2.0  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -18,11 +18,13 @@ Future Enhance updates might break functionality, although checks are in place t
 - Targeted processing — only modifies files when changes are actually needed
 - Webserver transition detection — monitors for switches between Nginx and OLS and reloads automatically
 - Automatic timestamped backups before any change, with rollback on failure
+- **Persistent logging**: Per-site webserver access logs written to `/var/www/<UUID>/logs/webserver.log`, for both Nginx and OLS
+- **PHP log persistence**: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
 
 ### Nginx
 - **HTTP/3**: QUIC listeners, Alt-Svc headers, and FastCGI HTTP_HOST fix, with optional QUIC Generic Segmentation Offloading (GSO)
 - **Security directives**: SSL, server hardening, and basic CMS/WordPress protection improvements, applied across all sites on the server
-- **Persistent logging**: Per-site access logs written to `/var/www/<UUID>/logs/webserver.log`, with optional Cloudflare real IP detection
+- **Persistent logging**: Per-site access logs with optional Cloudflare real IP detection
 - **FastCGI cache**: Configurable inactive timeout and cache validity period
 - **Client Max Body Size**: Configurable maximum upload and request body size
 
@@ -96,6 +98,9 @@ All settings are controlled through `settings.conf` in TOML format. All features
 |---------|---------|-------------|
 | `log_level` | `INFO` | `DEBUG` (everything), `INFO` (normal operations), `WARNING` (errors only) |
 | `debounce_seconds` | `10` | Seconds to wait after a file change before acting, to avoid reacting to partial writes |
+| `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/www/<UUID>/logs/webserver.log`. Applies to both Nginx and OLS. |
+| `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
+| `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
 
 ### Nginx
 
@@ -107,8 +112,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `ssl_upgrade` | `false` | Include `overrides/ssl.conf` — modern TLS settings |
 | `server_hardening` | `false` | Include `overrides/hardening.conf` — server hardening rules |
 | `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
-| `persistent_logging` | `false` | Persistent access logs to `/var/www/<UUID>/logs/webserver.log` |
-| `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` |
+| `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` in `[general]` |
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
@@ -157,7 +161,9 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 
 ### Persistent Logging
 
-When `persistent_logging` is enabled for Nginx, access logs are also written to `/var/www/<UUID>/logs/webserver.log` using an extended log format. When `real_ip_logging` is also enabled, Cloudflare visitor IPs are logged instead of edge server IPs.
+When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is also enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
+
+When `persistent_php_logs` is enabled, PHP logs are written to `/var/www/<UUID>/logs/php.log` - php-error.log for both webservers and php-fpm.log for Nginx.
 
 ### Log Rotation
 
@@ -165,17 +171,8 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 
 ```
 /var/log/webservertune-enhance/*.log
-{
-   rotate 15
-   weekly
-   missingok
-   notifempty
-   compress
-   delaycompress
-   copytruncate
-}
-
 /var/www/*/logs/webserver.log
+/var/www/*/logs/php.log
 /var/log/nginx/error.log
 /var/log/nginx/access.log
 {
@@ -185,9 +182,7 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
    notifempty
    compress
    delaycompress
-   postrotate
-      nginx -s reopen
-   endscript
+   copytruncate
 }
 ```
 
@@ -197,4 +192,5 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 
 ## Version History
 
+**0.2.0** — Persistent webserver/php logging for OLS/Nginx.
 **0.1.0** — Initial release, merging nginx/ols/503 scripts, logs, and configs.

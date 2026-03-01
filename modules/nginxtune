@@ -557,6 +557,7 @@ def apply_logging_features(config, logger):
     features    = config.get("nginx", {}).get("features", {})
     pers_on     = general.get("persistent_logging", False)
     realip_on   = features.get("real_ip_logging", False)
+    ip_var      = "$actual_addr" if realip_on else "$remote_addr"
 
     conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
     any_changed = False
@@ -578,8 +579,7 @@ def apply_logging_features(config, logger):
 
         for line in lines:
             s = line.strip()
-            if ("access_log /var/log/nginx/" in s or
-                    ("access_log /var/www/" in s and "/logs/webserver.log" in s)):
+            if "access_log /var/www/" in s and "/logs/webserver.log" in s:
                 has_pers_log = True
             elif "log_format" in s and "_persistent" in s:
                 has_pers_fmt = True
@@ -598,31 +598,22 @@ def apply_logging_features(config, logger):
         cur_pers   = has_pers_log and has_pers_fmt
         cur_realip = has_realip_map and has_realip_fmt
 
-        # Directory / ownership checks
-        needs_dir   = False
-        needs_chown = False
-        if uuid and pers_on:
-            logs_dir = Path(f"/var/www/{uuid}/logs")
-            if not logs_dir.exists():
-                needs_dir = True
-            else:
-                try:
-                    parent_stat = os.stat(f"/var/www/{uuid}")
-                    for lf in logs_dir.iterdir():
-                        if lf.is_file():
-                            fs = os.stat(lf)
-                            if fs.st_uid != parent_stat.st_uid or fs.st_gid != parent_stat.st_gid:
-                                needs_chown = True
-                                break
-                except Exception:
-                    pass
+        # Check if persistent format uses correct ip_var
+        pers_fmt_correct = True
+        if pers_on and has_pers_fmt:
+            for line in lines:
+                s = line.strip()
+                if "log_format" in s and "_persistent" in s:
+                    if ip_var not in s:
+                        pers_fmt_correct = False
+                    break
 
         if (cur_pers == pers_on and
                 cur_realip == realip_on and
-                not needs_dir and not needs_chown):
+                pers_fmt_correct):
             continue
 
-        # Fix directories and ownership first
+        # Fix directories and ownership
         if uuid and pers_on:
             _ensure_log_dir(uuid, logger)
 
@@ -640,14 +631,12 @@ def apply_logging_features(config, logger):
             if not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
                 continue
 
-            # Remove persistent log line when disabling
-            elif (not pers_on and
-                  ("access_log /var/log/nginx/" in s or
-                   ("access_log /var/www/" in s and "/logs/webserver.log" in s))):
+            # Remove persistent access_log line — always strip and re-add via enhance handler
+            elif "access_log /var/www/" in s and "/logs/webserver.log" in s:
                 continue
 
-            # Remove persistent log format when disabling
-            elif not pers_on and "log_format" in s and "_persistent" in s:
+            # Remove persistent log format — always strip and re-add with correct ip_var
+            elif "log_format" in s and "_persistent" in s:
                 continue
 
             # Update original log_format line for real IP
@@ -660,14 +649,14 @@ def apply_logging_features(config, logger):
                     new_lines.append(line)
 
                 # Append persistent format after original format
-                if pers_on and not pers_fmt_added and not has_pers_fmt:
+                if pers_on and not pers_fmt_added:
                     try:
                         parts = s.split()
                         if len(parts) >= 2:
                             fmt_name = parts[1]
                             pers_fmt = (
                                 f"log_format {fmt_name}_persistent "
-                                f"'$time_local - $actual_addr - $http_cf_ipcountry - "
+                                f"'$time_local - {ip_var} - $http_cf_ipcountry - "
                                 f"$server_protocol - $status - $request_method - "
                                 f"$host - $request_uri - $http_user_agent - "
                                 f"$upstream_cache_status - $request_time - "

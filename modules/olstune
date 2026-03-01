@@ -383,14 +383,17 @@ def _enforce_block(lines, target_block, desired, logger):
 # ---------------------------------------------------------------------------
 
 def _ensure_log_dir(uuid, logger):
-    logs_dir = Path(f"/var/www/{uuid}/logs")
+    site_dir = Path(f"/var/www/{uuid}")
+    if not site_dir.exists():
+        return
+    logs_dir = site_dir / "logs"
     try:
         if not logs_dir.exists():
             logs_dir.mkdir(parents=True, mode=0o755)
-            parent_stat = os.stat(f"/var/www/{uuid}")
+            parent_stat = os.stat(site_dir)
             os.chown(logs_dir, parent_stat.st_uid, parent_stat.st_gid)
 
-        parent_stat = os.stat(f"/var/www/{uuid}")
+        parent_stat = os.stat(site_dir)
         for lf in logs_dir.iterdir():
             if lf.is_file():
                 fs          = os.stat(lf)

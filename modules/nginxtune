@@ -1136,11 +1136,16 @@ def _php_log_watcher(config, logger):
     threading.Thread(target=inotify_loop, daemon=True).start()
 
     # Poll loop
+    cycle = 0
     while True:
         with reg_lock:
-            for entry in registry.values():
-                for key in ("error", "fpm"):
-                    for line in entry[key].readlines():
-                        if line.strip():
-                            entry["dest"].write(line)
+            snapshot = list(registry.items())
+        for uuid, entry in snapshot:
+            if cycle % 60 == 0:
+                _ensure_log_dir(uuid, logger)
+            for key in ("error", "fpm"):
+                for line in entry[key].readlines():
+                    if line.strip():
+                        entry["dest"].write(line)
+        cycle += 1
         time.sleep(1)

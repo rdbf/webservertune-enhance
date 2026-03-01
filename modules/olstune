@@ -567,13 +567,17 @@ def _ols_webserver_log_watcher(logger, site_watcher):
 
     site_watcher.register_consumer(on_add, on_remove)
 
+    cycle = 0
     while True:
         with reg_lock:
-            snapshot = list(registry.values())
-        for entry in snapshot:
+            snapshot = list(registry.items())
+        for uuid, entry in snapshot:
+            if cycle % 60 == 0:
+                _ensure_log_dir(uuid, logger)
             for line in entry["src"].readlines():
                 if line.strip():
                     entry["dest"].write(line)
+        cycle += 1
         time.sleep(1)
 
 
@@ -606,11 +610,15 @@ def _ols_php_log_watcher(logger, site_watcher):
 
     site_watcher.register_consumer(on_add, on_remove)
 
+    cycle = 0
     while True:
         with reg_lock:
-            snapshot = list(registry.values())
-        for entry in snapshot:
+            snapshot = list(registry.items())
+        for uuid, entry in snapshot:
+            if cycle % 60 == 0:
+                _ensure_log_dir(uuid, logger)
             for line in entry["src"].readlines():
                 if line.strip():
                     entry["dest"].write(line)
+        cycle += 1
         time.sleep(1)

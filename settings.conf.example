@@ -21,6 +21,7 @@ real_ip_logging = false
 fastcgi_cache_inactive = "60m"
 fastcgi_cache_valid = "60m"
 client_max_body_size = "200m"
+restart_manage = false
 
 
 [ols-webserver]

@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.2.0  
+**Version:** 0.2.1  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -8,7 +8,7 @@
 
 webservertune-enhance is an automated configuration service for Enhance hosting control panel servers that handles both Nginx and OpenLiteSpeed webservers. It monitors for configuration changes and re-applies settings automatically without manual intervention, adding features and resolving limitations in how Enhance implements each webserver.
 
-Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.16.0.
+Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.20.0.
 
 ## Features
 
@@ -116,6 +116,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
+| `restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 
 ### OLS Webserver Settings
 
@@ -191,6 +192,8 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel. They can also prevent ClientExec from completing automated version updates.
 
 ## Version History
+
+**0.2.1** — nginx systemd service restart management (`restart_manage`).
 
 **0.2.0** — Persistent webserver/php logging for OLS/Nginx.
 

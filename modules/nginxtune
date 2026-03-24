@@ -18,6 +18,7 @@ from pathlib import Path
 SITES_DIR    = Path("/etc/nginx/sites-enabled")
 BACKUP_BASE  = Path("/opt/webservertune-enhance/backups/nginx")
 OVERRIDES    = Path("/opt/webservertune-enhance/overrides")
+NGINX_DROPIN = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
 ALT_SVC      = 'h3=":443"; ma=86400'
 
 
@@ -28,6 +29,8 @@ ALT_SVC      = 'h3=":443"; ma=86400'
 def watch(config, logger):
     """Entry point called by main program. Runs startup check then watches for changes."""
     logger.info("nginxtune starting")
+
+    _apply_restart_manage(config, logger)
 
     # Brief delay on startup to allow nginx to fully initialise before
     # attempting any config changes or reloads
@@ -82,6 +85,44 @@ def watch(config, logger):
         ret = proc.wait()
         logger.warning(f"inotifywait exited (code {ret}), restarting watch in 5s")
         time.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# restart_manage: systemd drop-in management
+# ---------------------------------------------------------------------------
+
+DROPIN_CONTENT = """\
+[Service]
+RestartSec=15s
+
+[Unit]
+StartLimitIntervalSec=0
+"""
+
+def _apply_restart_manage(config, logger):
+    enabled     = config.get("nginx", {}).get("features", {}).get("restart_manage", False)
+    dropin_exists = NGINX_DROPIN.exists()
+
+    if enabled and not dropin_exists:
+        try:
+            NGINX_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+            NGINX_DROPIN.write_text(DROPIN_CONTENT)
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "reload", "nginx"], check=True)
+            logger.warning("restart_manage: drop-in installed, daemon-reload and nginx reload done")
+        except Exception as e:
+            logger.error(f"restart_manage: failed to install drop-in: {e}")
+
+    elif not enabled and dropin_exists:
+        try:
+            NGINX_DROPIN.unlink()
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            logger.warning("restart_manage: drop-in removed, daemon-reload done")
+        except Exception as e:
+            logger.error(f"restart_manage: failed to remove drop-in: {e}")
+
+    else:
+        logger.debug(f"restart_manage: no change needed (enabled={enabled}, exists={dropin_exists})")
 
 
 # ---------------------------------------------------------------------------

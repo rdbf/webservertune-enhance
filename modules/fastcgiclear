@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+fastcgiclear
+FastCGI cache clearing for Enhance hosting environments.
+Monitors for cache=stale flag files written by the WordPress mu-plugin
+and clears FastCGI cache via the Enhance API for all domains in the webspace.
+Called by webservertune-enhance main program.
+"""
+
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+WWW_DIR        = Path("/var/www")
+FLAG_FILE      = "clear.cache"
+MU_PLUGIN_NAME = "fastcgiclear.php"
+MU_PLUGIN_SRC  = Path("/opt/webservertune-enhance/assets") / MU_PLUGIN_NAME
+
+UUID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE
+)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def watch(config, logger):
+    """Entry point called by main program."""
+    logger.info("fastcgiclear starting")
+
+    general       = config.get("general", {})
+    fcc_cfg       = config.get("fastcgiclear", {})
+    debounce_secs = general.get("debounce_seconds", 10)
+
+    api_url   = general.get("enhance_url", "").rstrip("/")
+    org_id    = general.get("enhance_org_id", "")
+    api_token = general.get("enhance_token", "")
+
+    if not all([api_url, org_id, api_token]):
+        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [general]")
+        return
+
+    known_uuids     = set()
+    uuid_lock       = threading.Lock()
+    debounce_timers = {}
+    debounce_lock   = threading.Lock()
+    watcher_proc    = [None]
+
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+
+    def _get_webspace_pw(uuid):
+        try:
+            stat = os.stat(WWW_DIR / uuid)
+            return pwd.getpwuid(stat.st_uid)
+        except Exception:
+            return None
+
+    def _ensure_flag_file(uuid):
+        flag = WWW_DIR / uuid / FLAG_FILE
+        pw   = _get_webspace_pw(uuid)
+        if pw is None:
+            return
+        try:
+            if not flag.exists():
+                flag.write_text("cache=cleared\n")
+                os.chown(flag, pw.pw_uid, pw.pw_gid)
+                os.chmod(flag, 0o644)
+                logger.debug(f"[{uuid}] Created {FLAG_FILE}")
+            else:
+                st = os.stat(flag)
+                if st.st_uid != pw.pw_uid or st.st_gid != pw.pw_gid:
+                    os.chown(flag, pw.pw_uid, pw.pw_gid)
+                if (st.st_mode & 0o777) != 0o644:
+                    os.chmod(flag, 0o644)
+        except Exception as e:
+            logger.error(f"[{uuid}] Failed to ensure {FLAG_FILE}: {e}")
+
+    def _deploy_mu_plugin(uuid):
+        if not MU_PLUGIN_SRC.exists():
+            logger.warning(f"mu-plugin source not found: {MU_PLUGIN_SRC}")
+            return
+        pw = _get_webspace_pw(uuid)
+        if pw is None:
+            return
+        uuid_dir = WWW_DIR / uuid
+        for wp_config in uuid_dir.rglob("wp-config.php"):
+            if "wp-content" in wp_config.parts:
+                continue
+            wp_root = wp_config.parent
+            if not (wp_root / "wp-content").is_dir():
+                continue
+            mu_dir = wp_root / "wp-content" / "mu-plugins"
+            dest   = mu_dir / MU_PLUGIN_NAME
+            try:
+                mu_dir.mkdir(parents=True, exist_ok=True)
+                os.chown(mu_dir, pw.pw_uid, pw.pw_gid)
+                os.chmod(mu_dir, 0o755)
+                shutil.copy2(MU_PLUGIN_SRC, dest)
+                os.chown(dest, pw.pw_uid, pw.pw_gid)
+                os.chmod(dest, 0o644)
+                logger.info(f"[{uuid}] Deployed mu-plugin to {dest}")
+            except Exception as e:
+                logger.error(f"[{uuid}] Failed to deploy mu-plugin to {dest}: {e}")
+
+    def _handle_uuid(uuid):
+        with uuid_lock:
+            if uuid in known_uuids:
+                return
+            known_uuids.add(uuid)
+        logger.debug(f"Registered: {uuid}")
+        _ensure_flag_file(uuid)
+        _deploy_mu_plugin(uuid)
+        _restart_flag_watcher()
+
+    def _restart_flag_watcher():
+        proc = watcher_proc[0]
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+    # ---------------------------------------------------------------------------
+    # API
+    # ---------------------------------------------------------------------------
+
+    def _api_get(path):
+        url = f"{api_url}{path}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP {e.code} for {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Request failed for {url}: {e}")
+            return None
+
+    def _do_clear(uuid):
+        logger.info(f"[{uuid}] Clearing FastCGI cache")
+        data = _api_get(f"/orgs/{org_id}/websites/{uuid}/domains")
+        if data is None:
+            return
+
+        for item in data.get("items", []):
+            domain_id   = item.get("domainId")
+            domain_name = item.get("domain", domain_id)
+            if not domain_id:
+                continue
+            url = f"{api_url}/v2/domains/{domain_id}/nginx_fastcgi"
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {api_token}"},
+                method="DELETE"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    logger.info(f"[{uuid}] Cleared cache for {domain_name} ({resp.status})")
+            except urllib.error.HTTPError as e:
+                logger.error(f"[{uuid}] Failed to clear {domain_name}: HTTP {e.code}")
+            except Exception as e:
+                logger.error(f"[{uuid}] Failed to clear {domain_name}: {e}")
+
+        flag = WWW_DIR / uuid / FLAG_FILE
+        pw   = _get_webspace_pw(uuid)
+        try:
+            flag.write_text("cache=cleared\n")
+            if pw:
+                os.chown(flag, pw.pw_uid, pw.pw_gid)
+            os.chmod(flag, 0o644)
+            logger.debug(f"[{uuid}] Wrote cache=cleared")
+        except Exception as e:
+            logger.error(f"[{uuid}] Failed to write cache=cleared: {e}")
+
+    def _schedule_clear(uuid):
+        with debounce_lock:
+            existing = debounce_timers.get(uuid)
+            if existing:
+                existing.cancel()
+            t = threading.Timer(debounce_secs, lambda: _do_clear(uuid))
+            debounce_timers[uuid] = t
+            t.start()
+        logger.debug(f"[{uuid}] Debounce timer reset ({debounce_secs}s)")
+
+
+    # ---------------------------------------------------------------------------
+    # Flag watcher — reacts to CLOSE_WRITE on clear.cache in any UUID directory
+    # ---------------------------------------------------------------------------
+
+    def _flag_watcher_loop():
+        while True:
+            with uuid_lock:
+                paths = [str(WWW_DIR / u) for u in known_uuids]
+
+            if not paths:
+                time.sleep(5)
+                continue
+
+            cmd = [
+                "inotifywait", "--monitor", "--quiet",
+                "--format", "%w %e %f",
+                "--event", "close_write",
+            ] + paths
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                watcher_proc[0] = proc
+            except Exception as e:
+                logger.error(f"Failed to start flag watcher inotifywait: {e}")
+                time.sleep(5)
+                continue
+
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 2)
+                if len(parts) != 3:
+                    continue
+                watch_dir, _, filename = parts
+                if filename != FLAG_FILE:
+                    continue
+                m = UUID_RE.search(watch_dir)
+                if not m:
+                    continue
+                uuid = m.group(0)
+                flag = WWW_DIR / uuid / FLAG_FILE
+                try:
+                    content = flag.read_text().strip()
+                except Exception:
+                    continue
+                if content != "cache=stale":
+                    continue
+                logger.info(f"[{uuid}] cache=stale detected")
+                _schedule_clear(uuid)
+
+            proc.wait()
+            watcher_proc[0] = None
+            logger.debug("Flag watcher inotifywait exited, restarting")
+            time.sleep(1)
+
+
+    # ---------------------------------------------------------------------------
+    # UUID discovery — watches /var/www/ for new webspace directories
+    # ---------------------------------------------------------------------------
+
+    def _uuid_discovery_loop():
+        # Startup scan
+        try:
+            for entry in os.listdir(WWW_DIR):
+                if UUID_RE.fullmatch(entry):
+                    _handle_uuid(entry)
+        except Exception as e:
+            logger.error(f"Startup scan failed: {e}")
+
+        # Check for stale flags left over before service start
+        with uuid_lock:
+            snapshot = set(known_uuids)
+        for uuid in snapshot:
+            flag = WWW_DIR / uuid / FLAG_FILE
+            try:
+                if flag.exists() and flag.read_text().strip() == "cache=stale":
+                    logger.info(f"[{uuid}] Startup: stale cache flag found")
+                    _schedule_clear(uuid)
+            except Exception:
+                pass
+
+        cmd = [
+            "inotifywait", "--monitor", "--quiet",
+            "--format", "%e %f",
+            "--event", "create",
+            str(WWW_DIR),
+        ]
+
+        logger.info(f"Watching {WWW_DIR} for new UUID directories")
+
+        while True:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+            except FileNotFoundError:
+                logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
+                return
+            except Exception as e:
+                logger.error(f"UUID discovery inotifywait failed: {e}")
+                time.sleep(5)
+                continue
+
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                _, name = parts
+                if UUID_RE.fullmatch(name):
+                    logger.info(f"New UUID directory detected: {name}")
+                    time.sleep(5)
+                    _handle_uuid(name)
+
+            proc.wait()
+            logger.warning("UUID discovery inotifywait exited, restarting in 5s")
+            time.sleep(5)
+
+    # Start flag watcher in background thread, UUID discovery loop blocks here
+    threading.Thread(target=_flag_watcher_loop, daemon=True).start()
+    _uuid_discovery_loop()

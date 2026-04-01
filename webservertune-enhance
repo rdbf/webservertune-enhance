@@ -117,6 +117,16 @@ def main():
         )
         t.start()
 
+        if config.get("fastcgiclear", {}).get("enabled", False):
+            fastcgiclear = load_module("fastcgiclear")
+            fcc_logger   = setup_logger("fastcgiclear", log_level)
+            t_fcc        = threading.Thread(
+                target=fastcgiclear.watch,
+                args=(config, fcc_logger),
+                daemon=True
+            )
+            t_fcc.start()
+
     elif webserver == "ols":
         olstune    = load_module("olstune")
         ols_logger = setup_logger("olstune", log_level)

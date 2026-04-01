@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.2.1  
+**Version:** 0.3.0  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -26,6 +26,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - **Security directives**: SSL, server hardening, and basic CMS/WordPress protection improvements, applied across all sites on the server
 - **Persistent logging**: Per-site access logs with optional Cloudflare real IP detection
 - **FastCGI cache**: Configurable inactive timeout and cache validity period
+- **FastCGI cache clearing**: Clears Nginx FastCGI cache via the Enhance API when a WordPress update completes
 - **Client Max Body Size**: Configurable maximum upload and request body size
 
 ### OLS — Persistent Config
@@ -86,6 +87,7 @@ tail -f /var/log/webservertune-enhance/webservertune-enhance.log
 tail -f /var/log/webservertune-enhance/nginxtune.log
 tail -f /var/log/webservertune-enhance/olstune.log
 tail -f /var/log/webservertune-enhance/ols503fix.log
+tail -f /var/log/webservertune-enhance/fastcgiclear.log
 ```
 
 ## Configuration
@@ -101,6 +103,9 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/www/<UUID>/logs/webserver.log`. Applies to both Nginx and OLS. |
 | `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
+| `enhance_url` | — | Enhance panel API URL |
+| `enhance_org_id` | — | Enhance organisation UUID |
+| `enhance_token` | — | Enhance API bearer token |
 
 ### Nginx
 
@@ -118,6 +123,12 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
 | `restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 
+### FastCGI Cache Clear
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Load and start the fastcgiclear module — Nginx only |
+
 ### OLS Webserver Settings
 
 Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `[ols-webserver.general]` and named blocks such as `[ols-webserver.tuning]`. Block names must match exactly as they appear in `httpd_config.conf`. Several commented-out example values are included in `settings.conf.example` for reference.
@@ -130,9 +141,6 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enhance_url` | — | Enhance panel API URL |
-| `enhance_org_id` | — | Enhance organisation UUID |
-| `enhance_token` | — | Enhance API bearer token |
 | `window_seconds` | `30` | Sliding window in seconds for 503 counting |
 | `min_503_count` | `5` | Minimum 503 count within the window before evaluating a restart |
 | `min_503_percent` | `50` | Minimum percentage of recent requests that must be 503s to trigger a restart |
@@ -157,6 +165,7 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 | `nginxtune.log` | Nginx config changes, reloads, backups |
 | `olstune.log` | OLS config enforcement, backups, restarts |
 | `ols503fix.log` | 503 detection events and PHP restart actions |
+| `fastcgiclear.log` | FastCGI cache clear events |
 
 `INFO` is the recommended log level. `DEBUG` adds low-level inotify event detail.
 
@@ -192,6 +201,8 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel. They can also prevent ClientExec from completing automated version updates.
 
 ## Version History
+
+**0.3.0** — FastCGI cache clearing on WordPress update (`fastcgiclear`).
 
 **0.2.1** — nginx systemd service restart management (`restart_manage`).
 

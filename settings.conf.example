@@ -6,6 +6,9 @@ debounce_seconds = 10
 persistent_logging = false
 persistent_php_logs = false
 ols_503fix_enable = false
+enhance_url      = "https://example.com/api"
+enhance_org_id   = ""
+enhance_token    = ""
 
 
 [nginx]
@@ -23,6 +26,8 @@ fastcgi_cache_valid = "60m"
 client_max_body_size = "200m"
 restart_manage = false
 
+[fastcgiclear]
+enabled = false
 
 [ols-webserver]
 backup_retention_days = 30
@@ -54,11 +59,7 @@ backup_retention_days = 30
 #keepDays        = "7"
 #compressArchive = "1"
 
-
 [ols-503fix]
-enhance_url      = "https://example.com/api"
-enhance_org_id   = ""
-enhance_token    = ""
 window_seconds   = 30
 min_503_count    = 5
 min_503_percent  = 50

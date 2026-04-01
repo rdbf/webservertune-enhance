@@ -22,7 +22,11 @@ LOG_PATTERN = re.compile(r'"([^"]*)"')
 # ---------------------------------------------------------------------------
 
 def run(config, logger, site_watcher):
-    cfg = config.get("ols-503fix", {})
+    cfg     = config.get("ols-503fix", {})
+    general = config.get("general", {})
+
+    for key in ("enhance_url", "enhance_org_id", "enhance_token"):
+        cfg[key] = general.get(key, "")
 
     logger.info(
         f"ols503fix starting — window={cfg.get('window_seconds', 30)}s, "

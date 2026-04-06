@@ -1,8 +1,9 @@
 # Active config (contains credentials)
 settings.conf
 
-# Backups
+# Other generated content
 backups/
+redirects/
 
 # Python cache
 __pycache__/

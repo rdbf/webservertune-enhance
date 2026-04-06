@@ -177,13 +177,11 @@ def run(config, logger):
 
     logger.debug("Running enforcement check")
 
-    ols_config = config.get("ols-webserver", {})
+    ols_config = config.get("ols", {})
     lines      = OLS_CONF.read_text().splitlines(keepends=True)
     changed    = False
 
     for section, desired in ols_config.items():
-        if section == "backup_retention_days":
-            continue
         if not isinstance(desired, dict):
             continue
         if section.lower() == "general":
@@ -197,6 +195,7 @@ def run(config, logger):
 
     if not changed:
         logger.info("All target values correct, no changes needed")
+        _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
         return
 
     _create_backup(logger)
@@ -206,6 +205,7 @@ def run(config, logger):
 
     logger.debug("Triggering OLS restart")
     _restart_ols(logger)
+    _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +220,29 @@ def _create_backup(logger):
         logger.info(f"Backup created: {backup_path}")
     except Exception as e:
         logger.error(f"Failed to create backup: {e}")
+
+
+def _cleanup_old_backups(retention_days, logger):
+    try:
+        if not BACKUP_BASE.exists():
+            return
+        from datetime import timedelta
+        cutoff  = datetime.now() - timedelta(days=retention_days)
+        removed = 0
+        for d in BACKUP_BASE.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                ts = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
+                if ts < cutoff:
+                    shutil.rmtree(d)
+                    removed += 1
+            except ValueError:
+                continue
+        if removed:
+            logger.info(f"Removed {removed} old backup(s) older than {retention_days} days")
+    except Exception as e:
+        logger.error(f"Failed to clean up old backups: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -478,16 +501,20 @@ class FileWatcher:
 
 class _DestFile:
     def __init__(self, path, logger):
-        self.path   = path
-        self.logger = logger
-        self.fh     = None
+        self.path        = path
+        self.logger      = logger
+        self.fh          = None
+        self._error_logged = False
         self._open()
 
     def _open(self):
         try:
             self.fh = open(self.path, "a")
+            self._error_logged = False
         except OSError as e:
-            self.logger.error(f"Cannot open dest file {self.path}: {e}")
+            if not self._error_logged:
+                self.logger.error(f"Cannot open dest file {self.path}: {e}")
+                self._error_logged = True
             self.fh = None
 
     def write(self, line):
@@ -550,6 +577,9 @@ def _ols_webserver_log_watcher(logger, site_watcher):
     reg_lock = threading.Lock()
 
     def on_add(uuid):
+        if not Path(f"/var/www/{uuid}").exists():
+            logger.debug(f"[ols_webserver_log] Skipping {uuid} — /var/www/{uuid} does not exist")
+            return
         with reg_lock:
             if uuid in registry:
                 return
@@ -593,6 +623,9 @@ def _ols_php_log_watcher(logger, site_watcher):
     reg_lock = threading.Lock()
 
     def on_add(uuid):
+        if not Path(f"/var/www/{uuid}").exists():
+            logger.debug(f"[ols_php_log] Skipping {uuid} — /var/www/{uuid} does not exist")
+            return
         with reg_lock:
             if uuid in registry:
                 return

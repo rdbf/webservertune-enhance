@@ -100,7 +100,7 @@ StartLimitIntervalSec=0
 """
 
 def _apply_restart_manage(config, logger):
-    enabled     = config.get("nginx", {}).get("features", {}).get("restart_manage", False)
+    enabled       = config.get("general", {}).get("nginx_restart_manage", False)
     dropin_exists = NGINX_DROPIN.exists()
 
     if enabled and not dropin_exists:
@@ -135,8 +135,6 @@ def run(config, logger):
         logger.error("Backup failed, aborting run")
         return
 
-    nginx_cfg = config.get("nginx", {})
-
     changed  = False
     changed |= apply_http3_enable(config, logger)
     changed |= apply_quic_gso_enable(config, logger)
@@ -148,7 +146,7 @@ def run(config, logger):
     if not changed:
         logger.info("All configs up to date, no changes needed")
         _cleanup_backup(backup_dir, logger)
-        _cleanup_old_backups(nginx_cfg.get("backup_retention_days", 30), logger)
+        _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
         return
 
     ok, output = _test_nginx()
@@ -173,7 +171,7 @@ def run(config, logger):
         logging.shutdown()
         os._exit(0)
 
-    _cleanup_old_backups(nginx_cfg.get("backup_retention_days", 30), logger)
+    _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +787,7 @@ def _ensure_log_dir(uuid, logger):
 # ---------------------------------------------------------------------------
 
 def apply_fastcgi_cache_settings(config, logger):
-    features    = config.get("nginx", {}).get("features", {})
+    features     = config.get("nginx", {}).get("features", {})
     cfg_inactive = features.get("fastcgi_cache_inactive", "60m")
     cfg_valid    = features.get("fastcgi_cache_valid", "60m")
 

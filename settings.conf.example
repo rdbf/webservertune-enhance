@@ -1,43 +1,39 @@
 # webservertune-enhance — settings.conf
 
-[general]
-log_level = "INFO"
-debounce_seconds = 10
-persistent_logging = false
-persistent_php_logs = false
-ols_503fix_enable = false
+[api]
 enhance_url      = "https://example.com/api"
 enhance_org_id   = ""
 enhance_token    = ""
 
-
-[nginx]
+[general]
+log_level             = "INFO"
+debounce_seconds      = 10
+persistent_logging    = false
+persistent_php_logs   = false
+ols_503fix_enable     = false
+nginx_restart_manage  = false
 backup_retention_days = 30
 
 [nginx.features]
-http3_enable = false
-quic_gso_enable = false
-ssl_upgrade = false
-server_hardening = false
-cms_protection = false
-real_ip_logging = false
+http3_enable           = false
+quic_gso_enable        = false
+ssl_upgrade            = false
+server_hardening       = false
+cms_protection         = false
+real_ip_logging        = false
 fastcgi_cache_inactive = "60m"
-fastcgi_cache_valid = "60m"
-client_max_body_size = "200m"
-restart_manage = false
+fastcgi_cache_valid    = "60m"
+client_max_body_size   = "200m"
 
-[fastcgiclear]
+[nginx-fastcgiclear]
 enabled = false
 
-[ols-webserver]
-backup_retention_days = 30
-
-[ols-webserver.general]
+[ols.general]
 #cpuAffinity  = "1"
 #enableLVE    = "0"
 #inMemBufSize = "128M"
 
-[ols-webserver.tuning]
+[ols.tuning]
 #sndBufSize         = "512K"
 #rcvBufSize         = "512K"
 #useAIO             = "3"
@@ -46,7 +42,7 @@ backup_retention_days = 30
 #quicVersions       = "h3"
 #quicCongestionCtrl = "2"
 
-["ols-webserver"."errorlog logs/error.log"]
+["ols"."errorlog logs/error.log"]
 #logLevel        = "WARN"
 #debugLevel      = "0"
 #rollingSize     = "25M"
@@ -54,7 +50,7 @@ backup_retention_days = 30
 #compressArchive = "1"
 #enableStderrLog = "1"
 
-["ols-webserver"."accesslog logs/access.log"]
+["ols"."accesslog logs/access.log"]
 #rollingSize     = "25M"
 #keepDays        = "7"
 #compressArchive = "1"

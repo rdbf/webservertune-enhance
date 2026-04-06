@@ -117,7 +117,7 @@ def main():
         )
         t.start()
 
-        if config.get("fastcgiclear", {}).get("enabled", False):
+        if config.get("nginx-fastcgiclear", {}).get("enabled", False):
             fastcgiclear = load_module("fastcgiclear")
             fcc_logger   = setup_logger("fastcgiclear", log_level)
             t_fcc        = threading.Thread(

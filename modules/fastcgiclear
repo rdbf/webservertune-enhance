@@ -39,15 +39,15 @@ def watch(config, logger):
     logger.info("fastcgiclear starting")
 
     general       = config.get("general", {})
-    fcc_cfg       = config.get("fastcgiclear", {})
+    api           = config.get("api", {})
     debounce_secs = general.get("debounce_seconds", 10)
 
-    api_url   = general.get("enhance_url", "").rstrip("/")
-    org_id    = general.get("enhance_org_id", "")
-    api_token = general.get("enhance_token", "")
+    api_url   = api.get("enhance_url", "").rstrip("/")
+    org_id    = api.get("enhance_org_id", "")
+    api_token = api.get("enhance_token", "")
 
     if not all([api_url, org_id, api_token]):
-        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [general]")
+        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
         return
 
     known_uuids     = set()

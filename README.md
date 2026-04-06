@@ -94,6 +94,14 @@ tail -f /var/log/webservertune-enhance/fastcgiclear.log
 
 All settings are controlled through `settings.conf` in TOML format. All features are disabled by default, with FastCGI cache and Client Max Body Size set to match Enhance's defaults.
 
+### API
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enhance_url` | — | Enhance panel API URL |
+| `enhance_org_id` | — | Enhance organisation UUID |
+| `enhance_token` | — | Enhance API bearer token |
+
 ### General
 
 | Setting | Default | Description |
@@ -103,15 +111,13 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/www/<UUID>/logs/webserver.log`. Applies to both Nginx and OLS. |
 | `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
-| `enhance_url` | — | Enhance panel API URL |
-| `enhance_org_id` | — | Enhance organisation UUID |
-| `enhance_token` | — | Enhance API bearer token |
+| `nginx_restart_manage` | `false` | Manages the nginx systemd service restart configuration |
+| `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` and `backups/ols/` |
 
 ### Nginx
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` |
 | `http3_enable` | `false` | HTTP/3 support: QUIC listeners, Alt-Svc headers, FastCGI HTTP_HOST fix |
 | `quic_gso_enable` | `false` | QUIC Generic Segmentation Offloading — requires `http3_enable = true` |
 | `ssl_upgrade` | `false` | Include `overrides/ssl.conf` — modern TLS settings |
@@ -121,9 +127,8 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
-| `restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 
-### FastCGI Cache Clear
+### Nginx FastCGI Cache Clear
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -131,11 +136,11 @@ All settings are controlled through `settings.conf` in TOML format. All features
 
 ### OLS Webserver Settings
 
-Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `[ols-webserver.general]` and named blocks such as `[ols-webserver.tuning]`. Block names must match exactly as they appear in `httpd_config.conf`. Several commented-out example values are included in `settings.conf.example` for reference.
+Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `[ols.general]` and named blocks such as `[ols.tuning]`. Block names must match exactly as they appear in `httpd_config.conf`. Several commented-out example values are included in `settings.conf.example` for reference.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `backup_retention_days` | `30` | Days to retain backups in `backups/ols/` |
+| — | — | All settings are optional; only defined keys are enforced |
 
 ### OLS 503 Fix
 
@@ -153,7 +158,7 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 - **Location**: `/opt/webservertune-enhance/backups/`
 - **Validation**: Tests Nginx configuration with `nginx -t` before applying changes
 - **Rollback**: Restores from backup and reloads if validation or reload fails, then restarts the service to re-attempt
-- **Retention**: Configurable per webserver (default 30 days)
+- **Retention**: Configurable via `backup_retention_days` in `[general]` (default 30 days), applies to both Nginx and OLS
 
 ## Logging
 

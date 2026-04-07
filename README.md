@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.3.0  
+**Version:** 0.4.0  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -8,7 +8,7 @@
 
 webservertune-enhance is an automated configuration service for Enhance hosting control panel servers that handles both Nginx and OpenLiteSpeed webservers. It monitors for configuration changes and re-applies settings automatically without manual intervention, adding features and resolving limitations in how Enhance implements each webserver.
 
-Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.20.0.
+Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.21.1.
 
 ## Features
 
@@ -28,6 +28,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - **FastCGI cache**: Configurable inactive timeout and cache validity period
 - **FastCGI cache clearing**: Clears Nginx FastCGI cache via the Enhance API when a WordPress update completes
 - **Client Max Body Size**: Configurable maximum upload and request body size
+- **Redirect sync**: Syncs redirect rules created in the Enhance UI to Nginx, per domain
 
 ### OLS — Persistent Config
 
@@ -45,7 +46,7 @@ In Enhance, PHP runs in the website's own isolated container and is managed dire
 - Enhance hosting environment
 - Python 3.11+
 - inotify-tools: `apt install inotify-tools`
-- Nginx with HTTP/3 support compiled in (Enhance Nginx 1.26.3 includes this)
+- Nginx with HTTP/3 support compiled in (Enhance Nginx 1.28.0 includes this)
 
 ## Installation
 
@@ -88,6 +89,7 @@ tail -f /var/log/webservertune-enhance/nginxtune.log
 tail -f /var/log/webservertune-enhance/olstune.log
 tail -f /var/log/webservertune-enhance/ols503fix.log
 tail -f /var/log/webservertune-enhance/fastcgiclear.log
+tail -f /var/log/webservertune-enhance/nginxredirects.log
 ```
 
 ## Configuration
@@ -112,6 +114,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
 | `nginx_restart_manage` | `false` | Manages the nginx systemd service restart configuration |
+| `nginx_redirects` | `false` | Sync Enhance UI redirect rules to Nginx include files, per domain |
 | `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` and `backups/ols/` |
 
 ### Nginx
@@ -171,6 +174,7 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 | `olstune.log` | OLS config enforcement, backups, restarts |
 | `ols503fix.log` | 503 detection events and PHP restart actions |
 | `fastcgiclear.log` | FastCGI cache clear events |
+| `nginxredirects.log` | Redirect sync events and rule translation warnings |
 
 `INFO` is the recommended log level. `DEBUG` adds low-level inotify event detail.
 
@@ -206,6 +210,8 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel. They can also prevent ClientExec from completing automated version updates.
 
 ## Version History
+
+**0.4.0** — Nginx redirect sync from Enhance UI (`nginxredirects`).
 
 **0.3.0** — FastCGI cache clearing on WordPress update (`fastcgiclear`).
 

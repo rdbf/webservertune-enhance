@@ -127,6 +127,16 @@ def main():
             )
             t_fcc.start()
 
+        if config.get("general", {}).get("nginx_redirects", False):
+            nginxredirects = load_module("nginxredirects")
+            redir_logger   = setup_logger("nginxredirects", log_level)
+            t_redir        = threading.Thread(
+                target=nginxredirects.watch,
+                args=(config, redir_logger),
+                daemon=True
+            )
+            t_redir.start()
+
     elif webserver == "ols":
         olstune    = load_module("olstune")
         ols_logger = setup_logger("olstune", log_level)

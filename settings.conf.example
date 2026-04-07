@@ -12,6 +12,7 @@ persistent_logging    = false
 persistent_php_logs   = false
 ols_503fix_enable     = false
 nginx_restart_manage  = false
+nginx_redirects       = false
 backup_retention_days = 30
 
 [nginx.features]

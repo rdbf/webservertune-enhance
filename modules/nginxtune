@@ -18,6 +18,7 @@ from pathlib import Path
 SITES_DIR    = Path("/etc/nginx/sites-enabled")
 BACKUP_BASE  = Path("/opt/webservertune-enhance/backups/nginx")
 OVERRIDES    = Path("/opt/webservertune-enhance/overrides")
+REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
 NGINX_DROPIN = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
 ALT_SVC      = 'h3=":443"; ma=86400'
 
@@ -502,7 +503,8 @@ def apply_quic_gso_enable(config, logger):
 # ---------------------------------------------------------------------------
 
 def apply_include_features(config, logger):
-    features = config.get("nginx", {}).get("features", {})
+    features     = config.get("nginx", {}).get("features", {})
+    redirects_on = config.get("general", {}).get("nginx_redirects", False)
 
     include_map = {
         "ssl_upgrade":      f"include {OVERRIDES}/ssl.conf",
@@ -510,20 +512,24 @@ def apply_include_features(config, logger):
         "cms_protection":   f"include {OVERRIDES}/cms.conf",
     }
 
-    expected = [v for k, v in include_map.items() if features.get(k, False)]
+    expected   = [v for k, v in include_map.items() if features.get(k, False)]
     manageable = list(include_map.values())
 
     conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
     any_changed = False
 
     for cf in conf_files:
-        filename = cf.name
+        filename     = cf.name
+        redirect_inc = f"include {REDIRECTS_DIR}/{cf.stem}.conf"
 
         try:
             lines = cf.read_text().splitlines(keepends=True)
         except Exception as e:
             logger.error(f"Failed to read {filename}: {e}")
             continue
+
+        file_expected   = expected + ([redirect_inc] if redirects_on else [])
+        file_manageable = manageable + [redirect_inc]
 
         current  = []
         unwanted = []
@@ -532,6 +538,9 @@ def apply_include_features(config, logger):
         for line in lines:
             s = line.strip()
             if not s.startswith("include "):
+                continue
+            if s.rstrip(";") == redirect_inc:
+                current.append(redirect_inc)
                 continue
             inc_filename = Path(s.rstrip(";").split()[-1]).name
             if inc_filename not in managed_filenames:
@@ -542,8 +551,8 @@ def apply_include_features(config, logger):
             else:
                 unwanted.append(s.rstrip(";"))
 
-        to_add    = [i for i in expected if i not in current]
-        to_remove = [i for i in manageable if i in current and i not in expected]
+        to_add    = [i for i in file_expected if i not in current]
+        to_remove = [i for i in file_manageable if i in current and i not in file_expected]
 
         if not to_add and not to_remove and not unwanted:
             continue
@@ -570,13 +579,27 @@ def apply_include_features(config, logger):
                     new_lines.append(f"{base}{inc};\n")
                 includes_written = True
 
+        if not includes_written and to_add:
+            for j in range(len(new_lines) - 1, -1, -1):
+                if new_lines[j].strip() == "}":
+                    for inc in to_add:
+                        new_lines.insert(j, f"{inc};\n")
+                    includes_written = True
+                    break
+
         try:
             cf.write_text("".join(new_lines))
             parts = []
             if to_add:
-                parts.append(f"added {', '.join(k for k,v in include_map.items() if v in to_add)}")
+                names = [k for k, v in include_map.items() if v in to_add]
+                if redirect_inc in to_add:
+                    names.append("nginx_redirects")
+                parts.append(f"added {', '.join(names)}")
             if to_remove:
-                parts.append(f"removed {', '.join(k for k,v in include_map.items() if v in to_remove)}")
+                names = [k for k, v in include_map.items() if v in to_remove]
+                if redirect_inc in to_remove:
+                    names.append("nginx_redirects")
+                parts.append(f"removed {', '.join(names)}")
             if unwanted:
                 parts.append(f"cleaned {len(unwanted)} legacy includes")
             logger.warning(f"include_features: {'; '.join(parts)} — {filename}")

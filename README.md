@@ -208,6 +208,7 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 ## Known Issues
 
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel. They can also prevent ClientExec from completing automated version updates.
+- At the moment, full alias domain redirects ( / ) cause Let's Encrypt requests to fail.
 
 ## Version History
 

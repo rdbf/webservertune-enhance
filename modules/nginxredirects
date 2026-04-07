@@ -16,6 +16,7 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 SITES_DIR     = Path("/etc/nginx/sites-enabled")
 REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
@@ -36,11 +37,11 @@ def watch(config, logger):
     """Entry point called by main program."""
     logger.info("nginxredirects starting")
 
-    api        = config.get("api", {})
-    api_url    = api.get("enhance_url", "").rstrip("/")
-    master_org = api.get("enhance_org_id", "")
-    api_token  = api.get("enhance_token", "")
-    general    = config.get("general", {})
+    api           = config.get("api", {})
+    api_url       = api.get("enhance_url", "").rstrip("/")
+    master_org    = api.get("enhance_org_id", "")
+    api_token     = api.get("enhance_token", "")
+    general       = config.get("general", {})
     debounce_secs = general.get("debounce_seconds", 10)
 
     if not all([api_url, master_org, api_token]):
@@ -49,16 +50,13 @@ def watch(config, logger):
 
     REDIRECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # uuid -> org_id cache
     org_cache      = {}
     org_cache_lock = threading.Lock()
 
-    # known UUIDs being watched for .htaccess changes
     known_uuids  = set()
     uuid_lock    = threading.Lock()
     watcher_proc = [None]
 
-    # sites-enabled debounce
     sites_debounce_timer = [None]
     sites_debounce_lock  = threading.Lock()
 
@@ -113,7 +111,7 @@ def watch(config, logger):
     def _translate_rules(items):
         """
         Translate RewriteChain items to nginx return directives.
-        Returns dict of domain -> list of location block strings.
+        Returns dict of domain -> list of rule strings.
         Rules with query string conditions are skipped with a warning.
         """
         rules_by_domain = {}
@@ -125,11 +123,21 @@ def watch(config, logger):
             host_cond = next((c for c in conds if c.get("testString") == "%{HTTP_HOST}"), None)
             uri_cond  = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
 
-            if not host_cond or not uri_cond:
-                logger.warning(f"Skipping rule with missing host or URI condition: {item}")
+            if not host_cond:
+                logger.warning(f"Skipping rule with missing host condition: {item}")
                 continue
 
-            domain  = _extract_domain(host_cond["condPattern"])
+            domain = _extract_domain(host_cond["condPattern"])
+            flags  = rule.get("flags", [])
+            code   = next((f.split("=")[1] for f in flags if f.startswith("R=")), "301")
+
+            if not uri_cond:
+                target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$request_uri")
+                if domain not in rules_by_domain:
+                    rules_by_domain[domain] = []
+                rules_by_domain[domain].append(f"return {code} {target};")
+                continue
+
             pattern = uri_cond["condPattern"]
 
             if "?" in pattern:
@@ -139,8 +147,6 @@ def watch(config, logger):
                 )
                 continue
 
-            flags  = rule.get("flags", [])
-            code   = next((f.split("=")[1] for f in flags if f.startswith("R=")), "301")
             target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$1")
 
             if domain not in rules_by_domain:
@@ -392,14 +398,12 @@ def watch(config, logger):
                     continue
 
                 if "CREATE" in event or "MOVED_TO" in event:
-                    # New vhost — create empty conf immediately so nginx include doesn't fail
                     domain = Path(fname).stem
                     conf   = REDIRECTS_DIR / f"{domain}.conf"
                     if not conf.exists():
                         _write_conf(domain, [])
                         logger.debug(f"Created empty conf for new vhost: {domain}")
 
-                # Debounce full rescan for both create and delete
                 with sites_debounce_lock:
                     if sites_debounce_timer[0] is not None:
                         sites_debounce_timer[0].cancel()
@@ -417,7 +421,6 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _startup():
-        # Clear all existing redirect conf files for a clean rebuild
         try:
             for f in REDIRECTS_DIR.glob("*.conf"):
                 f.unlink()
@@ -425,12 +428,9 @@ def watch(config, logger):
         except Exception as e:
             logger.error(f"Failed to clear redirects dir: {e}")
 
-        # First pass — write empty conf files for all vhosts immediately so
-        # nginx -t never fails on a missing include file
         for cf in _site_confs():
             _write_conf(cf.stem, [])
 
-        # Build org cache once before populating redirect rules
         _build_org_cache()
 
         site_uuids = []
@@ -449,7 +449,6 @@ def watch(config, logger):
                 with changed_lock:
                     changed_flags.append(True)
 
-        from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=5) as executor:
             executor.map(sync_one, site_uuids)
 

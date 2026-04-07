@@ -135,7 +135,11 @@ def watch(config, logger):
                 target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$request_uri")
                 if domain not in rules_by_domain:
                     rules_by_domain[domain] = []
-                rules_by_domain[domain].append(f"return {code} {target};")
+                rules_by_domain[domain].append(
+                    f"location ~ ^(?!/.well-known)(.*)$ {{\n"
+                    f"    return {code} {target};\n"
+                    f"}}"
+                )
                 continue
 
             pattern = uri_cond["condPattern"]

@@ -131,11 +131,6 @@ def _apply_restart_manage(config, logger):
 # ---------------------------------------------------------------------------
 
 def run(config, logger):
-    backup_dir = _create_backup(logger)
-    if not backup_dir:
-        logger.error("Backup failed, aborting run")
-        return
-
     changed  = False
     changed |= apply_http3_enable(config, logger)
     changed |= apply_quic_gso_enable(config, logger)
@@ -146,8 +141,12 @@ def run(config, logger):
 
     if not changed:
         logger.info("All configs up to date, no changes needed")
-        _cleanup_backup(backup_dir, logger)
         _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
+        return
+
+    backup_dir = _create_backup(logger)
+    if not backup_dir:
+        logger.error("Backup failed, aborting run")
         return
 
     ok, output = _test_nginx()

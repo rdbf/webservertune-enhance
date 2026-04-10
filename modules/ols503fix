@@ -278,13 +278,15 @@ class SiteRegistry:
                 )
                 domain = state.get_domain(self.config, self.logger)
                 if domain is not None:
-                    probe = _probe_site(domain, self.logger)
-                    if probe is not None and probe in (200, 301, 302):
-                        self.logger.info(
-                            f"[{wid}] Probe of {domain} returned {probe} — "
-                            f"site is responding normally, skipping restart"
-                        )
-                        continue
+                    probe = _probe_site(domain)
+                    if probe is not None:
+                        self.logger.info(f"[{wid}] Probe of {domain} returned {probe} — " +
+                            ("site is responding normally, skipping restart" if probe in (200, 301, 302)
+                             else "triggering PHP restart"))
+                        if probe in (200, 301, 302):
+                            continue
+                    else:
+                        self.logger.info(f"[{wid}] Probe of {domain} timed out — triggering PHP restart")
                 self.logger.info(f"[{wid}] Restarting PHP")
                 success = _restart_php(wid, self.config, self.logger)
                 state.mark_restarted()
@@ -324,15 +326,13 @@ def _get_primary_domain(website_id, config, logger):
         return None
 
 
-def _probe_site(domain, logger):
+def _probe_site(domain):
     import random
     url = f"https://{domain}/?probe={random.randint(1, 999999)}"
     try:
         resp = requests.get(url, timeout=3, allow_redirects=True)
-        logger.debug(f"Probe {url} returned {resp.status_code}")
         return resp.status_code
-    except requests.RequestException as e:
-        logger.warning(f"Probe {url} failed: {e}")
+    except requests.RequestException:
         return None
 
 

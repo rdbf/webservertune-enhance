@@ -55,6 +55,7 @@ def watch(config, logger):
 
     known_uuids  = set()
     uuid_lock    = threading.Lock()
+    # mutable container so the htaccess watcher loop can be restarted from other functions
     watcher_proc = [None]
 
     sites_debounce_timer = [None]
@@ -66,6 +67,7 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _api_get(path):
+        """Perform a GET request against the Enhance API and return parsed JSON, or None on error."""
         url = f"{api_url}{path}"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
         try:
@@ -79,21 +81,35 @@ def watch(config, logger):
             return None
 
     def _build_org_cache():
-        data = _api_get(f"/orgs/{master_org}/customers?recursive=true&limit=100")
-        if data is None:
-            return
+        """
+        Fetch all websites under the master org recursively and build a
+        {website_id: org_id} mapping. Paginates until all websites are retrieved.
+        """
+        websites = {}
+        offset   = 0
+        limit    = 100
+
+        while True:
+            data = _api_get(
+                f"/orgs/{master_org}/websites"
+                f"?recursion=infinite&offset={offset}&limit={limit}"
+            )
+            if data is None:
+                return
+            for site in data.get("items", []):
+                websites[site["id"]] = site["orgId"]
+            total = data.get("total", 0)
+            offset += limit
+            if offset >= total:
+                break
+
         with org_cache_lock:
             org_cache.clear()
-            for cust in data.get("items", []):
-                cust_id = cust["id"]
-                sites   = _api_get(f"/orgs/{cust_id}/websites?limit=100")
-                if sites is None:
-                    continue
-                for site in sites.get("items", []):
-                    org_cache[site["id"]] = site["orgId"]
+            org_cache.update(websites)
         logger.info(f"Org cache built: {len(org_cache)} website(s)")
 
     def _get_org_id(uuid):
+        """Return the org ID for a website UUID from the cache, or None if not found."""
         with org_cache_lock:
             return org_cache.get(uuid)
 
@@ -103,7 +119,7 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _extract_domain(cond_pattern):
-        """Strip ^(www.)? prefix and $ suffix from host condPattern."""
+        """Strip ^(www.)? prefix and $ suffix from a host condPattern to get the bare domain."""
         domain = re.sub(r'^\^\(www\.\)\?', '', cond_pattern)
         domain = re.sub(r'\$$', '', domain)
         return domain.strip()
@@ -112,7 +128,7 @@ def watch(config, logger):
         """
         Translate RewriteChain items to nginx return directives.
         Returns dict of domain -> list of rule strings.
-        Rules with query string conditions are skipped with a warning.
+        Rules with query string conditions are skipped — nginx has no equivalent.
         """
         rules_by_domain = {}
 
@@ -188,6 +204,7 @@ def watch(config, logger):
             return False
 
     def _reload_nginx():
+        """Test nginx config and reload if valid. Logs and skips reload if test fails."""
         try:
             test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
             if test.returncode != 0:
@@ -213,7 +230,7 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _extract_uuid_from_conf(cf):
-        """Extract UUID from the Enhance access_log line in a vhost conf."""
+        """Extract site UUID from the Enhance-generated access_log line in a vhost conf."""
         try:
             for line in cf.read_text().splitlines():
                 s = line.strip()
@@ -226,6 +243,7 @@ def watch(config, logger):
         return None
 
     def _site_confs():
+        """Return all vhost conf files, excluding the control panel 000- prefix and default.conf."""
         return [
             f for f in SITES_DIR.glob("*.conf")
             if not f.name.startswith("000-") and f.name != "default.conf"
@@ -275,6 +293,7 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _register_uuid(uuid):
+        """Register a UUID for .htaccess watching, restarting the watcher to pick up the new path."""
         with uuid_lock:
             if uuid in known_uuids:
                 return
@@ -283,6 +302,7 @@ def watch(config, logger):
         _restart_htaccess_watcher()
 
     def _restart_htaccess_watcher():
+        """Terminate the running inotifywait process so the htaccess watcher loop restarts it."""
         proc = watcher_proc[0]
         if proc is not None:
             try:
@@ -296,6 +316,10 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _htaccess_watcher_loop():
+        """
+        Watch for CLOSE_WRITE and CREATE on .htaccess across all registered webspace directories.
+        Restarts inotifywait whenever a new UUID is registered via _restart_htaccess_watcher().
+        """
         while True:
             with uuid_lock:
                 paths = [str(WWW_DIR / u) for u in known_uuids if (WWW_DIR / u).exists()]
@@ -373,6 +397,7 @@ def watch(config, logger):
                     logger.error(f"Failed to remove {conf.name}: {e}")
 
     def _sites_watcher_loop():
+        """Watch sites-enabled for vhost additions and removals, triggering a debounced rescan."""
         cmd = [
             "inotifywait", "--monitor", "--quiet",
             "--format", "%e %f",
@@ -425,6 +450,10 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _startup():
+        """
+        Clear existing redirect confs, build the org cache, register all current
+        vhosts, and sync redirect rules for all sites in parallel.
+        """
         try:
             for f in REDIRECTS_DIR.glob("*.conf"):
                 f.unlink()

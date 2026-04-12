@@ -22,9 +22,11 @@ LOG_PATTERN = re.compile(r'"([^"]*)"')
 # ---------------------------------------------------------------------------
 
 def run(config, logger, site_watcher):
+    """Entry point called by main program. Merges API config into module config and starts processing."""
     cfg     = config.get("ols-503fix", {})
     api     = config.get("api", {})
 
+    # merge API credentials into cfg so they're accessible throughout the module
     for key in ("enhance_url", "enhance_org_id", "enhance_token"):
         cfg[key] = api.get(key, "")
 
@@ -49,6 +51,7 @@ def run(config, logger, site_watcher):
 # ---------------------------------------------------------------------------
 
 def _parse_status(line):
+    """Extract the HTTP status code from a quoted-field log line. Returns None if unparseable."""
     matches = LOG_PATTERN.findall(line)
     if len(matches) >= 4:
         try:
@@ -63,17 +66,21 @@ def _parse_status(line):
 # ---------------------------------------------------------------------------
 
 class SiteState:
+    """Tracks request and 503 error history for a single site within configurable time windows."""
+
     def __init__(self, website_id, config):
         self.website_id     = website_id
         self.config         = config
         self.all_requests   = deque()
         self.errors_503     = deque()
+        # separate 24h deque so long-term counts survive the short sliding window prune
         self.errors_503_24h = deque()
         self.last_restart   = 0.0
         self._domain        = None
         self._domain_ts     = 0.0
 
     def record(self, status_code):
+        """Record a request, appending timestamp to the relevant deques."""
         now = time.time()
         self.all_requests.append(now)
         if status_code == 503:
@@ -81,6 +88,7 @@ class SiteState:
             self.errors_503_24h.append(now)
 
     def _prune(self, now):
+        """Remove entries outside the sliding window and 24h window from all deques."""
         cutoff = now - self.config.get("window_seconds", 30)
         while self.all_requests and self.all_requests[0] < cutoff:
             self.all_requests.popleft()
@@ -91,6 +99,7 @@ class SiteState:
             self.errors_503_24h.popleft()
 
     def count_24h(self):
+        """Return the number of 503 errors recorded in the last 24 hours."""
         now = time.time()
         cutoff = now - 86400
         while self.errors_503_24h and self.errors_503_24h[0] < cutoff:
@@ -98,6 +107,11 @@ class SiteState:
         return len(self.errors_503_24h)
 
     def should_restart(self, logger):
+        """
+        Evaluate whether a PHP restart should be triggered.
+        Returns (trigger, total_requests, error_count, error_percent).
+        Restart is suppressed if within the cooldown period.
+        """
         now = time.time()
         self._prune(now)
 
@@ -109,6 +123,7 @@ class SiteState:
         if errors < self.config.get("min_503_count", 5):
             return False, total, errors, 0
 
+        # evaluate the percentage of 503s among the last N requests
         last_n  = self.config.get("last_n_requests", 10)
         recent  = list(self.all_requests)[-last_n:]
         if not recent:
@@ -135,11 +150,13 @@ class SiteState:
         return True, total, errors, pct
 
     def mark_restarted(self):
+        """Record restart time and clear request history to reset the sliding window."""
         self.last_restart = time.time()
         self.all_requests.clear()
         self.errors_503.clear()
 
     def get_domain(self, config, logger):
+        """Return the primary domain for this site, using a 5-minute cache to reduce API calls."""
         now = time.time()
         if self._domain is not None and now - self._domain_ts < 300:
             logger.debug(f"[{self.website_id}] Using cached domain: {self._domain}")
@@ -156,6 +173,8 @@ class SiteState:
 # ---------------------------------------------------------------------------
 
 class FileWatcher:
+    """Tail a log file, handling rotation and truncation."""
+
     def __init__(self, path, logger, seek_to_end_on_open=True):
         self.path                = path
         self.logger              = logger
@@ -166,6 +185,7 @@ class FileWatcher:
         self._open()
 
     def _open(self):
+        """Open the file and record its inode. Seeks to end if seek_to_end_on_open is set."""
         try:
             self.fh = open(self.path, "r", errors="replace")
             self.inode = __import__("os").fstat(self.fh.fileno()).st_ino
@@ -178,6 +198,7 @@ class FileWatcher:
             self.inode = None
 
     def _reopen_if_needed(self):
+        """Reopen the file if it has been rotated (inode changed) or truncated."""
         import os
         try:
             stat = os.stat(self.path)
@@ -204,6 +225,7 @@ class FileWatcher:
             self.position = 0
 
     def readlines(self):
+        """Return any new lines written since the last read."""
         self._reopen_if_needed()
         if self.fh is None:
             return []
@@ -221,6 +243,8 @@ class FileWatcher:
 # ---------------------------------------------------------------------------
 
 class SiteRegistry:
+    """Manages per-site FileWatcher and SiteState instances, driven by OLSSiteWatcher callbacks."""
+
     def __init__(self, config, logger):
         self.config   = config
         self.logger   = logger
@@ -229,6 +253,7 @@ class SiteRegistry:
         self._lock    = threading.Lock()
 
     def add_site(self, wid):
+        """Register a new site, creating a FileWatcher and SiteState for it."""
         import os
         with self._lock:
             if wid in self.watchers:
@@ -239,6 +264,7 @@ class SiteRegistry:
             self.states[wid]   = SiteState(wid, self.config)
 
     def remove_site(self, wid):
+        """Deregister a site and close its file handle."""
         with self._lock:
             if wid not in self.watchers:
                 return
@@ -248,6 +274,7 @@ class SiteRegistry:
             del self.states[wid]
 
     def process(self):
+        """Read new log lines for all sites and evaluate restart thresholds."""
         with self._lock:
             snapshot = [
                 (wid, self.watchers[wid], self.states[wid])
@@ -301,6 +328,7 @@ class SiteRegistry:
 # ---------------------------------------------------------------------------
 
 def _get_primary_domain(website_id, config, logger):
+    """Fetch the primary domain for a website from the Enhance API. Returns None on failure."""
     org_id = config.get("enhance_org_id", "")
     if not org_id:
         logger.warning(f"[{website_id}] enhance_org_id not set — skipping domain probe")
@@ -327,6 +355,10 @@ def _get_primary_domain(website_id, config, logger):
 
 
 def _probe_site(domain):
+    """
+    Make a cachebust GET request to the site to verify its actual response.
+    Returns the final HTTP status code, or None on timeout/connection error.
+    """
     import random
     url = f"https://{domain}/?probe={random.randint(1, 999999)}"
     try:
@@ -337,6 +369,7 @@ def _probe_site(domain):
 
 
 def _restart_php(website_id, config, logger):
+    """Trigger a PHP restart for the website via the Enhance API. Returns True on success."""
     url     = f"{config.get('enhance_url', '').rstrip('/')}/v2/websites/{website_id}/restart_php"
     headers = {"Authorization": f"Bearer {config.get('enhance_token', '')}"}
     try:

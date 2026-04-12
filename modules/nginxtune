@@ -6,6 +6,7 @@ Manages HTTP/3, security includes, logging, FastCGI cache and body size settings
 Called by webservertune-enhance main program.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -33,7 +34,7 @@ def watch(config, logger):
 
     _apply_restart_manage(config, logger)
 
-    # Brief delay on startup to allow nginx to fully initialise before
+    # brief delay on startup to allow nginx to fully initialise before
     # attempting any config changes or reloads
     time.sleep(15)
 
@@ -92,6 +93,7 @@ def watch(config, logger):
 # restart_manage: systemd drop-in management
 # ---------------------------------------------------------------------------
 
+# drop-in content that prevents nginx from hitting systemd restart limits
 DROPIN_CONTENT = """\
 [Service]
 RestartSec=15s
@@ -101,6 +103,7 @@ StartLimitIntervalSec=0
 """
 
 def _apply_restart_manage(config, logger):
+    """Install or remove the nginx systemd drop-in based on the nginx_restart_manage setting."""
     enabled       = config.get("general", {}).get("nginx_restart_manage", False)
     dropin_exists = NGINX_DROPIN.exists()
 
@@ -131,6 +134,10 @@ def _apply_restart_manage(config, logger):
 # ---------------------------------------------------------------------------
 
 def run(config, logger):
+    """
+    Back up all vhost confs, apply all configured features, test with nginx -t,
+    reload nginx if changed, or restore from backup and exit if reload fails.
+    """
     backup_dir = _create_backup(logger)
     if not backup_dir:
         logger.error("Backup failed, aborting run")
@@ -169,6 +176,7 @@ def run(config, logger):
                 logger.error("Reload of restored config also failed")
         else:
             logger.error("Backup restore failed")
+        # flush logs before forcing process exit so systemd restarts cleanly
         logging.shutdown()
         os._exit(0)
 
@@ -180,6 +188,7 @@ def run(config, logger):
 # ---------------------------------------------------------------------------
 
 def _create_backup(logger):
+    """Copy all vhost confs to a timestamped backup directory. Returns the path or None on failure."""
     backup_dir = BACKUP_BASE / datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -193,6 +202,7 @@ def _create_backup(logger):
 
 
 def _restore_backup(backup_dir, logger):
+    """Restore vhost confs from a backup directory. Returns True on success."""
     try:
         for f in backup_dir.glob("*.conf"):
             shutil.copy2(f, SITES_DIR / f.name)
@@ -204,6 +214,7 @@ def _restore_backup(backup_dir, logger):
 
 
 def _cleanup_backup(backup_dir, logger):
+    """Remove a backup directory after a successful run where no reload was needed."""
     try:
         shutil.rmtree(backup_dir)
         logger.info(f"Removed backup: {backup_dir}")
@@ -212,6 +223,7 @@ def _cleanup_backup(backup_dir, logger):
 
 
 def _cleanup_old_backups(retention_days, logger):
+    """Remove backup directories older than retention_days."""
     try:
         if not BACKUP_BASE.exists():
             return
@@ -238,6 +250,7 @@ def _cleanup_old_backups(retention_days, logger):
 # ---------------------------------------------------------------------------
 
 def _test_nginx():
+    """Run nginx -t and return (success, stderr output)."""
     try:
         result = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
         return result.returncode == 0, result.stderr
@@ -246,6 +259,7 @@ def _test_nginx():
 
 
 def _reload_nginx(logger):
+    """Reload nginx via systemctl. Returns True on success."""
     try:
         result = subprocess.run(
             ["systemctl", "reload", "nginx"], capture_output=True, text=True
@@ -261,6 +275,7 @@ def _reload_nginx(logger):
 # ---------------------------------------------------------------------------
 
 def _indent(lines, index, fallback="    "):
+    """Return the leading whitespace of a line, used to match surrounding indentation."""
     try:
         line = lines[index]
         n    = len(line) - len(line.lstrip())
@@ -270,6 +285,7 @@ def _indent(lines, index, fallback="    "):
 
 
 def _php_indent(lines, index, fallback="                "):
+    """Return the indentation for content inside a PHP location block (line indent + 4 spaces)."""
     try:
         line = lines[index]
         n    = len(line) - len(line.lstrip())
@@ -283,6 +299,11 @@ def _php_indent(lines, index, fallback="                "):
 # ---------------------------------------------------------------------------
 
 def apply_http3_enable(config, logger):
+    """
+    Add or remove HTTP/3 QUIC listeners, http2/http3 directives, Alt-Svc headers,
+    and the FastCGI HTTP_HOST fix across all vhost confs. Skips files already
+    matching the target state.
+    """
     features     = config.get("nginx", {}).get("features", {})
     http3        = features.get("http3_enable", False)
     conf_files   = _site_confs()
@@ -300,7 +321,7 @@ def apply_http3_enable(config, logger):
 
         has_php = any("location ~ \\.php$" in l for l in lines)
 
-        # Target state
+        # target state varies between the default.conf and regular vhost confs
         if is_default:
             if http3:
                 t_listeners  = [
@@ -347,7 +368,7 @@ def apply_http3_enable(config, logger):
                 t_headers    = []
                 t_php_adds   = []
 
-        # Current state
+        # detect current state
         c_listeners = []
         c_directives = []
         c_headers    = []
@@ -381,7 +402,7 @@ def apply_http3_enable(config, logger):
                 php_match):
             continue
 
-        # Rebuild
+        # rebuild the file with the target state
         new_lines       = []
         listeners_added = False
         directives_added = False
@@ -453,7 +474,12 @@ def apply_http3_enable(config, logger):
 # ---------------------------------------------------------------------------
 
 def apply_quic_gso_enable(config, logger):
+    """
+    Add or remove the quic_gso on directive across all vhost confs.
+    Only effective when http3_enable is also true.
+    """
     features      = config.get("nginx", {}).get("features", {})
+    # quic_gso requires http3 to be enabled; force off if http3 is disabled
     effective     = features.get("quic_gso_enable", False) and features.get("http3_enable", False)
     conf_files    = _site_confs()
     any_changed   = False
@@ -503,6 +529,11 @@ def apply_quic_gso_enable(config, logger):
 # ---------------------------------------------------------------------------
 
 def apply_include_features(config, logger):
+    """
+    Add or remove managed include directives (ssl, hardening, cms, redirects)
+    from all non-default vhost confs. Inserts after the vhost_includes line,
+    or before the closing brace if that line is absent.
+    """
     features     = config.get("nginx", {}).get("features", {})
     redirects_on = config.get("general", {}).get("nginx_redirects", False)
 
@@ -579,6 +610,7 @@ def apply_include_features(config, logger):
                     new_lines.append(f"{base}{inc};\n")
                 includes_written = True
 
+        # fallback: insert before closing brace if vhost_includes line was not found
         if not includes_written and to_add:
             for j in range(len(new_lines) - 1, -1, -1):
                 if new_lines[j].strip() == "}":
@@ -615,10 +647,16 @@ def apply_include_features(config, logger):
 # ---------------------------------------------------------------------------
 
 def apply_logging_features(config, logger):
+    """
+    Add or remove persistent access logging and real IP detection across all
+    non-default vhost confs. The persistent log format is always stripped and
+    re-added during any rebuild to prevent duplicates.
+    """
     general     = config.get("general", {})
     features    = config.get("nginx", {}).get("features", {})
     pers_on     = general.get("persistent_logging", False)
     realip_on   = features.get("real_ip_logging", False)
+    # ip_var is derived once here; all format strings must use this variable consistently
     ip_var      = "$actual_addr" if realip_on else "$remote_addr"
 
     conf_files  = [f for f in _site_confs() if f.name != "default.conf"]
@@ -660,7 +698,7 @@ def apply_logging_features(config, logger):
         cur_pers   = has_pers_log and has_pers_fmt
         cur_realip = has_realip_map and has_realip_fmt
 
-        # Check if persistent format uses correct ip_var
+        # check if the persistent format uses the correct ip_var for the current settings
         pers_fmt_correct = True
         if pers_on and has_pers_fmt:
             for line in lines:
@@ -675,11 +713,10 @@ def apply_logging_features(config, logger):
                 pers_fmt_correct):
             continue
 
-        # Fix directories and ownership
         if uuid and pers_on:
             _ensure_log_dir(uuid, logger)
 
-        # Rebuild config
+        # rebuild config
         new_lines       = []
         realip_added    = False
         pers_added      = False
@@ -689,19 +726,17 @@ def apply_logging_features(config, logger):
             s    = line.strip()
             base = _indent(lines, i)
 
-            # Remove real IP map when disabling
             if not realip_on and "map $http_cf_connecting_ip $actual_addr" in s:
                 continue
 
-            # Remove persistent access_log line — always strip and re-add via enhance handler
+            # always strip the persistent log line — re-added below to prevent duplicates
             elif "access_log /var/www/" in s and "/logs/webserver.log" in s:
                 continue
 
-            # Remove persistent log format — always strip and re-add with correct ip_var
+            # always strip the persistent format — re-added below with correct ip_var
             elif "log_format" in s and "_persistent" in s:
                 continue
 
-            # Update original log_format line for real IP
             elif "log_format" in s and "_persistent" not in s:
                 if realip_on and "$remote_addr" in s:
                     new_lines.append(line.replace("$remote_addr", "$actual_addr"))
@@ -710,7 +745,6 @@ def apply_logging_features(config, logger):
                 else:
                     new_lines.append(line)
 
-                # Append persistent format after original format
                 if pers_on and not pers_fmt_added:
                     try:
                         parts = s.split()
@@ -730,7 +764,6 @@ def apply_logging_features(config, logger):
                         pass
                 continue
 
-            # Insert real IP map before fastcgi_cache_path
             elif (s.startswith("fastcgi_cache_path") and realip_on
                   and not realip_added and not has_realip_map):
                 new_lines.append(
@@ -741,7 +774,6 @@ def apply_logging_features(config, logger):
                 realip_added = True
                 continue
 
-            # Insert persistent log line after enhance access_log
             elif ("access_log /var/local/enhance/webserver_logs/" in s
                   and pers_on and not pers_added):
                 new_lines.append(line)
@@ -780,6 +812,7 @@ def apply_logging_features(config, logger):
 
 
 def _ensure_log_dir(uuid, logger):
+    """Create /var/www/{uuid}/logs/ if absent and correct ownership and permissions on log files."""
     site_dir = Path(f"/var/www/{uuid}")
     if not site_dir.exists():
         return
@@ -810,6 +843,7 @@ def _ensure_log_dir(uuid, logger):
 # ---------------------------------------------------------------------------
 
 def apply_fastcgi_cache_settings(config, logger):
+    """Update fastcgi_cache_path inactive timeout and fastcgi_cache_valid period in all vhost confs."""
     features     = config.get("nginx", {}).get("features", {})
     cfg_inactive = features.get("fastcgi_cache_inactive", "60m")
     cfg_valid    = features.get("fastcgi_cache_valid", "60m")
@@ -872,10 +906,16 @@ def apply_fastcgi_cache_settings(config, logger):
 # ---------------------------------------------------------------------------
 
 def apply_client_max_body_size(config, logger):
+    """
+    Set client_max_body_size across all non-control-panel vhost confs.
+    The control panel vhost is detected and its specific values (0 inside
+    location blocks, 2000m at server level) are preserved rather than overwritten.
+    """
     features     = config.get("nginx", {}).get("features", {})
     cfg_size     = features.get("client_max_body_size", "200m")
 
     all_confs    = list(SITES_DIR.glob("*.conf"))
+    # 000- prefix indicates a control panel server
     is_cp_server = any(f.name.startswith("000-") for f in all_confs)
     conf_files   = [f for f in all_confs if not f.name.startswith("000-") and f.name != "default.conf"]
     any_changed  = False
@@ -971,6 +1011,7 @@ def apply_client_max_body_size(config, logger):
 # ---------------------------------------------------------------------------
 
 def _site_confs():
+    """Return all vhost conf files, excluding the control panel 000- prefix files."""
     try:
         return [f for f in SITES_DIR.glob("*.conf") if not f.name.startswith("000-")]
     except Exception:
@@ -978,7 +1019,7 @@ def _site_confs():
 
 
 def _extract_uuid_from_conf(cf):
-    """Extract site UUID from the Enhance-generated access_log line in a conf file."""
+    """Extract site UUID from the Enhance-generated access_log line in a vhost conf."""
     try:
         for line in cf.read_text().splitlines():
             s = line.strip()
@@ -996,6 +1037,8 @@ def _extract_uuid_from_conf(cf):
 # ---------------------------------------------------------------------------
 
 class FileWatcher:
+    """Tail a log file, handling rotation and truncation."""
+
     def __init__(self, path, logger, seek_to_end_on_open=True):
         self.path                = path
         self.logger              = logger
@@ -1006,6 +1049,7 @@ class FileWatcher:
         self._open()
 
     def _open(self):
+        """Open the file and record its inode. Seeks to end if seek_to_end_on_open is set."""
         try:
             self.fh = open(self.path, "r", errors="replace")
             self.inode = os.fstat(self.fh.fileno()).st_ino
@@ -1018,6 +1062,7 @@ class FileWatcher:
             self.inode = None
 
     def _reopen_if_needed(self):
+        """Reopen the file if it has been rotated (inode changed) or truncated."""
         try:
             stat = os.stat(self.path)
         except OSError:
@@ -1043,6 +1088,7 @@ class FileWatcher:
             self.position = 0
 
     def readlines(self):
+        """Return any new lines written since the last read."""
         self._reopen_if_needed()
         if self.fh is None:
             return []
@@ -1060,6 +1106,8 @@ class FileWatcher:
 # ---------------------------------------------------------------------------
 
 class _DestFile:
+    """Keep a destination log file open in append mode, reopening on write failure."""
+
     def __init__(self, path, logger):
         self.path   = path
         self.logger = logger
@@ -1074,6 +1122,7 @@ class _DestFile:
             self.fh = None
 
     def write(self, line):
+        """Write a line, reopening the file handle if it was lost."""
         if self.fh is None:
             self._open()
             if self.fh is None:
@@ -1102,7 +1151,7 @@ class _DestFile:
 # ---------------------------------------------------------------------------
 
 def _start_php_log_thread(config, logger):
-    """Start PHP log persistence thread if enabled."""
+    """Start the PHP log persistence thread if persistent_php_logs is enabled."""
     if not config.get("general", {}).get("persistent_php_logs", False):
         return
     t = threading.Thread(target=_php_log_watcher, args=(config, logger), daemon=True)
@@ -1112,12 +1161,12 @@ def _start_php_log_thread(config, logger):
 
 def _php_log_watcher(config, logger):
     """
-    Tails per-site php-error.log and php-fpm.log into /var/www/{uuid}/logs/php.log.
+    Tail per-site php-error.log and php-fpm.log into /var/www/{uuid}/logs/php.log.
     Site discovery via inotify on sites-enabled plus full scan at startup.
     """
-    registry     = {}  # uuid -> {"error": FileWatcher, "fpm": FileWatcher, "dest": _DestFile}
-    fname_to_uuid = {}  # conf_filename -> uuid
-    reg_lock     = threading.Lock()
+    registry      = {}  # uuid -> {"error": FileWatcher, "fpm": FileWatcher, "dest": _DestFile}
+    fname_to_uuid = {}  # conf filename -> uuid
+    reg_lock      = threading.Lock()
 
     def register(uuid, conf_name):
         if uuid in registry:
@@ -1143,7 +1192,7 @@ def _php_log_watcher(config, logger):
             entry["dest"].close()
             logger.debug(f"[php_log] Unregistered site: {uuid}")
 
-    # Startup scan
+    # startup scan
     with reg_lock:
         for cf in SITES_DIR.glob("*.conf"):
             if cf.name.startswith("000-"):
@@ -1152,8 +1201,8 @@ def _php_log_watcher(config, logger):
             if uuid:
                 register(uuid, cf.name)
 
-    # inotify watcher for site additions and removals
     def inotify_loop():
+        """Watch sites-enabled for new and removed vhost confs to keep the registry current."""
         cmd = [
             "inotifywait", "--monitor", "--quiet",
             "--format", "%e %f",
@@ -1189,12 +1238,12 @@ def _php_log_watcher(config, logger):
 
     threading.Thread(target=inotify_loop, daemon=True).start()
 
-    # Poll loop
     cycle = 0
     while True:
         with reg_lock:
             snapshot = list(registry.items())
         for uuid, entry in snapshot:
+            # periodically correct ownership and permissions on log files
             if cycle % 60 == 0:
                 _ensure_log_dir(uuid, logger)
             for key in ("error", "fpm"):

@@ -25,6 +25,12 @@ OLS_RESTART = ["/usr/local/lsws/bin/lswsctrl", "restart"]
 # ---------------------------------------------------------------------------
 
 class OLSSiteWatcher:
+    """
+    Shared inotify-based registry of active OLS sites, driven by log file
+    creation and deletion in OLS_LOG_DIR. Consumers register callbacks for
+    site add and remove events.
+    """
+
     def __init__(self, logger):
         self._logger    = logger
         self._lock      = threading.Lock()
@@ -32,6 +38,7 @@ class OLSSiteWatcher:
         self._consumers = []
 
     def register_consumer(self, on_add, on_remove):
+        """Register add/remove callbacks. Immediately fires on_add for all currently known sites."""
         with self._lock:
             self._consumers.append((on_add, on_remove))
             known_snapshot = set(self._known)
@@ -39,6 +46,7 @@ class OLSSiteWatcher:
             on_add(uuid)
 
     def start(self):
+        """Scan OLS_LOG_DIR for existing sites and start the inotify watcher thread."""
         try:
             for f in OLS_LOG_DIR.iterdir():
                 if f.suffix == ".log":
@@ -51,6 +59,7 @@ class OLSSiteWatcher:
         self._logger.info(f"[OLSSiteWatcher] Started, {len(self._known)} sites found")
 
     def _fire_add(self, uuid):
+        """Add a UUID to the known set and notify all consumers."""
         with self._lock:
             if uuid in self._known:
                 return
@@ -60,6 +69,7 @@ class OLSSiteWatcher:
             on_add(uuid)
 
     def _fire_remove(self, uuid):
+        """Remove a UUID from the known set and notify all consumers."""
         with self._lock:
             if uuid not in self._known:
                 return
@@ -69,6 +79,7 @@ class OLSSiteWatcher:
             on_remove(uuid)
 
     def _inotify_loop(self):
+        """Watch OLS_LOG_DIR for log file creation and deletion to detect site changes."""
         cmd = [
             "inotifywait", "--monitor", "--quiet",
             "--format", "%e %f",
@@ -138,6 +149,7 @@ def watch(config, logger, site_watcher):
             debounce_timer.start()
 
     def watch_loop():
+        """Watch OLS_CONF parent directory and trigger a debounced run on config file changes."""
         while True:
             try:
                 logger.info(f"Watching {watch_dir} via inotifywait")
@@ -171,15 +183,17 @@ def watch(config, logger, site_watcher):
 # ---------------------------------------------------------------------------
 
 def run(config, logger):
+    """Back up the config, enforce all configured values, and restart OLS if anything changed."""
     if not OLS_CONF.exists():
         logger.error(f"OLS config not found: {OLS_CONF}")
         return
 
     logger.debug("Running enforcement check")
 
-    ols_config = config.get("ols", {})
-    lines      = OLS_CONF.read_text().splitlines(keepends=True)
-    changed    = False
+    debounce_secs = config.get("general", {}).get("debounce_seconds", 10)
+    ols_config    = config.get("ols", {})
+    lines         = OLS_CONF.read_text().splitlines(keepends=True)
+    changed       = False
 
     for section, desired in ols_config.items():
         if not isinstance(desired, dict):
@@ -204,7 +218,12 @@ def run(config, logger):
     OLS_CONF.write_text("".join(lines))
 
     logger.debug("Triggering OLS restart")
-    _restart_ols(logger)
+    if not _restart_ols(logger, debounce_secs):
+        logger.error("OLS did not return to active state — restoring backup")
+        _restore_backup(logger)
+        # fire-and-forget restart after restore, no further checking
+        _restart_ols(logger, debounce_secs=0)
+
     _cleanup_old_backups(config.get("general", {}).get("backup_retention_days", 30), logger)
 
 
@@ -213,6 +232,7 @@ def run(config, logger):
 # ---------------------------------------------------------------------------
 
 def _create_backup(logger):
+    """Create a timestamped backup of httpd_config.conf before writing changes."""
     backup_path = BACKUP_BASE / datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         backup_path.mkdir(parents=True, exist_ok=True)
@@ -222,7 +242,22 @@ def _create_backup(logger):
         logger.error(f"Failed to create backup: {e}")
 
 
+def _restore_backup(logger):
+    """Restore httpd_config.conf from the most recent timestamped backup."""
+    try:
+        backups = sorted(BACKUP_BASE.iterdir(), reverse=True)
+        if not backups:
+            logger.error("No backups found to restore from")
+            return
+        latest = backups[0]
+        shutil.copy2(latest / OLS_CONF.name, OLS_CONF)
+        logger.info(f"Restored from backup: {latest}")
+    except Exception as e:
+        logger.error(f"Failed to restore backup: {e}")
+
+
 def _cleanup_old_backups(retention_days, logger):
+    """Remove backup directories older than retention_days."""
     try:
         if not BACKUP_BASE.exists():
             return
@@ -249,15 +284,37 @@ def _cleanup_old_backups(retention_days, logger):
 # OLS restart
 # ---------------------------------------------------------------------------
 
-def _restart_ols(logger):
+def _restart_ols(logger, debounce_secs):
+    """
+    Issue an OLS restart and poll systemctl up to 10 times with debounce_secs interval
+    to confirm the service returns to active. Returns True if active is seen, False if
+    all 10 checks return non-active.
+    """
     try:
         result = subprocess.run(OLS_RESTART, capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("OLS restart successful")
-        else:
-            logger.error(f"OLS restart failed: {result.stderr.strip()}")
+        if result.returncode != 0:
+            logger.error(f"OLS restart command failed: {result.stderr.strip()}")
     except Exception as e:
         logger.error(f"OLS restart error: {e}")
+
+    for attempt in range(1, 11):
+        if debounce_secs > 0:
+            time.sleep(debounce_secs)
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", "lshttpd"],
+                capture_output=True, text=True
+            )
+            state = result.stdout.strip()
+            logger.debug(f"OLS state check {attempt}/10: {state}")
+            if state == "active":
+                logger.info(f"OLS active after {attempt} check(s)")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to check OLS state: {e}")
+
+    logger.error("OLS did not return to active state after 10 checks")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +322,10 @@ def _restart_ols(logger):
 # ---------------------------------------------------------------------------
 
 def _enforce_general(lines, desired, logger):
+    """
+    Enforce top-level key/value pairs in httpd_config.conf outside any block.
+    Amends existing keys and inserts missing ones before the first block.
+    """
     new_lines     = []
     changed       = False
     keys_seen     = set()
@@ -277,6 +338,7 @@ def _enforce_general(lines, desired, logger):
         stripped = line.strip()
 
         if stripped.endswith("{"):
+            # record insertion point before the first block so new keys land with the others
             if depth == 0 and insert_before is None:
                 insert_before = len(new_lines)
             depth += stripped.count("{")
@@ -303,7 +365,7 @@ def _enforce_general(lines, desired, logger):
     if insert_before is None:
         insert_before = len(new_lines)
 
-    # Walk backwards past any blank lines so insertions land with the other keys
+    # walk backwards past blank lines so insertions land with the other keys
     while insert_before > 0 and not new_lines[insert_before - 1].strip():
         insert_before -= 1
 
@@ -321,6 +383,10 @@ def _enforce_general(lines, desired, logger):
 
 
 def _enforce_block(lines, target_block, desired, logger):
+    """
+    Enforce key/value pairs within a named block in httpd_config.conf.
+    Amends existing keys and inserts missing ones before the block closing brace.
+    """
     new_lines     = []
     changed       = False
     in_block      = False
@@ -354,7 +420,7 @@ def _enforce_block(lines, target_block, desired, logger):
                 depth -= stripped.count("}")
 
             if depth == 0:
-                # Find insert point by walking back past blank lines
+                # walk backwards past blank lines so insertions land with the other keys
                 insert_before = len(new_lines)
                 while insert_before > 0 and not new_lines[insert_before - 1].strip():
                     insert_before -= 1
@@ -406,6 +472,7 @@ def _enforce_block(lines, target_block, desired, logger):
 # ---------------------------------------------------------------------------
 
 def _ensure_log_dir(uuid, logger):
+    """Create /var/www/{uuid}/logs/ if absent and correct ownership and permissions on log files."""
     site_dir = Path(f"/var/www/{uuid}")
     if not site_dir.exists():
         return
@@ -436,6 +503,8 @@ def _ensure_log_dir(uuid, logger):
 # ---------------------------------------------------------------------------
 
 class FileWatcher:
+    """Tail a log file, handling rotation and truncation."""
+
     def __init__(self, path, logger, seek_to_end_on_open=True):
         self.path                = path
         self.logger              = logger
@@ -446,6 +515,7 @@ class FileWatcher:
         self._open()
 
     def _open(self):
+        """Open the file and record its inode. Seeks to end if seek_to_end_on_open is set."""
         try:
             self.fh = open(self.path, "r", errors="replace")
             self.inode = os.fstat(self.fh.fileno()).st_ino
@@ -458,6 +528,7 @@ class FileWatcher:
             self.inode = None
 
     def _reopen_if_needed(self):
+        """Reopen the file if it has been rotated (inode changed) or truncated."""
         try:
             stat = os.stat(self.path)
         except OSError:
@@ -483,6 +554,7 @@ class FileWatcher:
             self.position = 0
 
     def readlines(self):
+        """Return any new lines written since the last read."""
         self._reopen_if_needed()
         if self.fh is None:
             return []
@@ -500,6 +572,8 @@ class FileWatcher:
 # ---------------------------------------------------------------------------
 
 class _DestFile:
+    """Keep a destination log file open in append mode, reopening on write failure."""
+
     def __init__(self, path, logger):
         self.path        = path
         self.logger      = logger
@@ -518,6 +592,7 @@ class _DestFile:
             self.fh = None
 
     def write(self, line):
+        """Write a line, reopening the file handle if it was lost."""
         if self.fh is None:
             self._open()
             if self.fh is None:
@@ -546,7 +621,7 @@ class _DestFile:
 # ---------------------------------------------------------------------------
 
 def _start_ols_log_threads(config, logger, site_watcher):
-    """Start OLS log persistence threads if enabled."""
+    """Start OLS webserver and PHP log persistence threads if enabled in config."""
     general = config.get("general", {})
 
     if general.get("persistent_logging", False):
@@ -570,7 +645,7 @@ def _start_ols_log_threads(config, logger, site_watcher):
 
 def _ols_webserver_log_watcher(logger, site_watcher):
     """
-    Tails /var/local/enhance/webserver_logs/{uuid}.log into
+    Tail /var/local/enhance/webserver_logs/{uuid}.log into
     /var/www/{uuid}/logs/webserver.log for each active OLS site.
     """
     registry = {}
@@ -605,6 +680,7 @@ def _ols_webserver_log_watcher(logger, site_watcher):
         with reg_lock:
             snapshot = list(registry.items())
         for uuid, entry in snapshot:
+            # periodically correct ownership and permissions on log files
             if cycle % 60 == 0:
                 _ensure_log_dir(uuid, logger)
             for line in entry["src"].readlines():
@@ -616,7 +692,7 @@ def _ols_webserver_log_watcher(logger, site_watcher):
 
 def _ols_php_log_watcher(logger, site_watcher):
     """
-    Tails /var/www/{uuid}/php-error.log into /var/www/{uuid}/logs/php.log
+    Tail /var/www/{uuid}/php-error.log into /var/www/{uuid}/logs/php.log
     for each active OLS site. OLS does not produce php-fpm.log.
     """
     registry = {}
@@ -651,6 +727,7 @@ def _ols_php_log_watcher(logger, site_watcher):
         with reg_lock:
             snapshot = list(registry.items())
         for uuid, entry in snapshot:
+            # periodically correct ownership and permissions on log files
             if cycle % 60 == 0:
                 _ensure_log_dir(uuid, logger)
             for line in entry["src"].readlines():

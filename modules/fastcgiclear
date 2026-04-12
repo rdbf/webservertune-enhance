@@ -54,6 +54,7 @@ def watch(config, logger):
     uuid_lock       = threading.Lock()
     debounce_timers = {}
     debounce_lock   = threading.Lock()
+    # mutable container so the flag watcher loop can be restarted from other functions
     watcher_proc    = [None]
 
 
@@ -62,6 +63,7 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _get_webspace_pw(uuid):
+        """Return pwd entry for the system user owning the webspace directory."""
         try:
             stat = os.stat(WWW_DIR / uuid)
             return pwd.getpwuid(stat.st_uid)
@@ -69,6 +71,7 @@ def watch(config, logger):
             return None
 
     def _ensure_flag_file(uuid):
+        """Create the flag file if absent, and correct ownership/permissions if wrong."""
         flag = WWW_DIR / uuid / FLAG_FILE
         pw   = _get_webspace_pw(uuid)
         if pw is None:
@@ -89,6 +92,10 @@ def watch(config, logger):
             logger.error(f"[{uuid}] Failed to ensure {FLAG_FILE}: {e}")
 
     def _deploy_mu_plugin(uuid):
+        """
+        Deploy the mu-plugin to every WordPress install found in the webspace.
+        Skips wp-config.php files inside wp-content to avoid false matches.
+        """
         if not MU_PLUGIN_SRC.exists():
             logger.warning(f"mu-plugin source not found: {MU_PLUGIN_SRC}")
             return
@@ -116,6 +123,7 @@ def watch(config, logger):
                 logger.error(f"[{uuid}] Failed to deploy mu-plugin to {dest}: {e}")
 
     def _handle_uuid(uuid):
+        """Register a new webspace UUID, set up its flag file, and deploy the mu-plugin."""
         with uuid_lock:
             if uuid in known_uuids:
                 return
@@ -123,9 +131,11 @@ def watch(config, logger):
         logger.debug(f"Registered: {uuid}")
         _ensure_flag_file(uuid)
         _deploy_mu_plugin(uuid)
+        # restart the flag watcher so it picks up the new webspace path
         _restart_flag_watcher()
 
     def _restart_flag_watcher():
+        """Terminate the running inotifywait process so the flag watcher loop restarts it."""
         proc = watcher_proc[0]
         if proc is not None:
             try:
@@ -139,6 +149,7 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _api_get(path):
+        """Perform a GET request against the Enhance API and return parsed JSON, or None on error."""
         url = f"{api_url}{path}"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
         try:
@@ -152,6 +163,10 @@ def watch(config, logger):
             return None
 
     def _do_clear(uuid):
+        """
+        Clear FastCGI cache for all domains in the webspace via the Enhance API,
+        then reset the flag file to cache=cleared.
+        """
         logger.info(f"[{uuid}] Clearing FastCGI cache")
         data = _api_get(f"/orgs/{org_id}/websites/{uuid}/domains")
         if data is None:
@@ -188,6 +203,7 @@ def watch(config, logger):
             logger.error(f"[{uuid}] Failed to write cache=cleared: {e}")
 
     def _schedule_clear(uuid):
+        """Schedule a debounced cache clear, cancelling any pending timer for the same UUID."""
         with debounce_lock:
             existing = debounce_timers.get(uuid)
             if existing:
@@ -203,6 +219,10 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _flag_watcher_loop():
+        """
+        Watch for CLOSE_WRITE on clear.cache across all registered webspace directories.
+        Restarts inotifywait whenever a new UUID is registered via _restart_flag_watcher().
+        """
         while True:
             with uuid_lock:
                 paths = [str(WWW_DIR / u) for u in known_uuids]
@@ -259,7 +279,11 @@ def watch(config, logger):
     # ---------------------------------------------------------------------------
 
     def _uuid_discovery_loop():
-        # Startup scan
+        """
+        Scan /var/www/ for existing UUID directories at startup, then watch for new ones
+        via inotify. Also checks for stale flag files left over before service start.
+        """
+        # startup scan
         try:
             for entry in os.listdir(WWW_DIR):
                 if UUID_RE.fullmatch(entry):
@@ -267,7 +291,7 @@ def watch(config, logger):
         except Exception as e:
             logger.error(f"Startup scan failed: {e}")
 
-        # Check for stale flags left over before service start
+        # check for stale flags written before the service started
         with uuid_lock:
             snapshot = set(known_uuids)
         for uuid in snapshot:
@@ -283,6 +307,7 @@ def watch(config, logger):
             "inotifywait", "--monitor", "--quiet",
             "--format", "%e %f",
             "--event", "create",
+            "--event", "moved_to",
             str(WWW_DIR),
         ]
 
@@ -308,6 +333,7 @@ def watch(config, logger):
                 _, name = parts
                 if UUID_RE.fullmatch(name):
                     logger.info(f"New UUID directory detected: {name}")
+                    # brief delay to allow Enhance to finish setting up the webspace
                     time.sleep(5)
                     _handle_uuid(name)
 
@@ -315,6 +341,6 @@ def watch(config, logger):
             logger.warning("UUID discovery inotifywait exited, restarting in 5s")
             time.sleep(5)
 
-    # Start flag watcher in background thread, UUID discovery loop blocks here
+    # start flag watcher in background thread; UUID discovery loop blocks here
     threading.Thread(target=_flag_watcher_loop, daemon=True).start()
     _uuid_discovery_loop()

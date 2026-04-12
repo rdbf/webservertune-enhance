@@ -19,10 +19,12 @@ CONFIG_FILE = BASE_DIR / "settings.conf"
 LOG_DIR     = Path("/var/log/webservertune-enhance")
 MODULES_DIR = BASE_DIR / "modules"
 
+# seconds between webserver change detection polls
 DETECT_INTERVAL = 30
 
 
 def load_config():
+    """Load and parse settings.conf. Exits on missing file or TOML error."""
     try:
         import tomllib
     except ImportError:
@@ -40,11 +42,14 @@ def load_config():
 
 
 def setup_logger(name, log_level):
+    """Create a named logger writing to both a log file and stdout."""
     log_file = LOG_DIR / f"{name}.log"
     logger   = logging.getLogger(name)
+    # getattr with fallback so an invalid log_level in config defaults to INFO
     level    = getattr(logging, log_level.upper(), logging.INFO)
     logger.setLevel(level)
 
+    # guard against duplicate handlers if setup_logger is called more than once for the same name
     if not logger.handlers:
         fmt = logging.Formatter(
             "%(asctime)s %(levelname).1s %(message)s",
@@ -61,14 +66,17 @@ def setup_logger(name, log_level):
 
 
 def is_active(service):
+    """Return True if the systemd service is running or in a transitional state."""
     result = subprocess.run(
         ["systemctl", "is-active", service],
         capture_output=True, text=True
     )
+    # include transient states to avoid false negatives mid-restart
     return result.stdout.strip() in ("active", "reloading", "activating", "deactivating")
 
 
 def detect_webserver():
+    """Return 'nginx', 'ols', or None depending on which webserver is active."""
     if is_active("nginx"):
         return "nginx"
     if is_active("lshttpd"):
@@ -77,6 +85,7 @@ def detect_webserver():
 
 
 def load_module(name):
+    """Dynamically load a module from the modules directory by filename."""
     from importlib.machinery import SourceFileLoader
     path   = MODULES_DIR / name
     loader = SourceFileLoader(name, str(path))
@@ -87,10 +96,16 @@ def load_module(name):
 
 
 def main():
+    """
+    Entry point. Detects the active webserver, loads and starts the appropriate
+    modules as daemon threads, then monitors for webserver changes and config
+    file updates, exiting to trigger a systemd restart when either occurs.
+    """
     if os.geteuid() != 0:
         print("ERROR: Must be run as root", file=sys.stderr)
         sys.exit(1)
 
+    # created here so log files are available before any module is loaded
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     config    = load_config()
@@ -110,6 +125,7 @@ def main():
         nginxtune    = load_module("nginxtune")
         nginx_logger = setup_logger("nginxtune", log_level)
 
+        # all module threads are daemon threads so they exit automatically when main exits
         t = threading.Thread(
             target=nginxtune.watch,
             args=(config, nginx_logger),
@@ -141,6 +157,8 @@ def main():
         olstune    = load_module("olstune")
         ols_logger = setup_logger("olstune", log_level)
 
+        # OLSSiteWatcher is a shared inotify-based site registry; must be started before
+        # any module that registers consumers against it
         site_watcher = olstune.OLSSiteWatcher(ols_logger)
         site_watcher.start()
 
@@ -162,6 +180,7 @@ def main():
             t2.start()
 
     def watch_config():
+        """Watch for settings.conf changes and exit so systemd restarts the service."""
         cmd = [
             "inotifywait", "--monitor", "--quiet",
             "--format", "%e %f",
@@ -180,10 +199,12 @@ def main():
             if len(parts) == 2 and parts[1] == CONFIG_FILE.name:
                 logger.warning("settings.conf changed, exiting for systemd restart")
                 logging.shutdown()
+                # os._exit bypasses Python cleanup to ensure immediate process termination
                 os._exit(0)
 
     threading.Thread(target=watch_config, daemon=True).start()
 
+    # poll for webserver changes; sys.exit is sufficient here as no logging flush is needed
     while True:
         time.sleep(DETECT_INTERVAL)
         current = detect_webserver()

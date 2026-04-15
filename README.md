@@ -207,6 +207,7 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 
 ## Known Issues
 
+- The Nginx version that Enhance ships is built against an old OpenSSL version (v3.0.13 - 30 Jan 2024), meaning that quic/http3 performance will be poor at best.
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel. They can also prevent ClientExec from completing automated version updates.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied and log an error.
 

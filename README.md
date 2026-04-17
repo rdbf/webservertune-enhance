@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.4.0  
+**Version:** 0.5.0  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -30,15 +30,10 @@ Future Enhance updates might break functionality, although checks are in place t
 - **Client Max Body Size**: Configurable maximum upload and request body size
 - **Redirect sync**: Syncs redirect rules created in the Enhance UI to Nginx, per domain
 
-### OLS — Persistent Config
-
-Enforce key/value settings in `httpd_config.conf` that Enhance periodically overwrites. Settings are re-applied automatically whenever Enhance modifies the file.
-
-> **Note:** Not all OLS settings are honoured by Enhance regardless of what is written to `httpd_config.conf`. This includes all lsphp/lsapi settings and 503 error handling — these cannot be controlled through this config.
-
-### OLS — 503 Fix
-
-In Enhance, PHP runs in the website's own isolated container and is managed directly by Enhance, meaning OLS cannot control PHP restarts. When PHP becomes stuck due to resource exhaustion — bot storms, DDoS, underpowered hardware, inefficient resource limits, or poor website code — this results in sustained 503 errors with no self-recovery. This module monitors per-site access logs for 503 spikes and triggers a PHP restart via the Enhance API when thresholds are met, allowing the site to recover. It does not address the underlying cause of the 503 spikes.
+### OLS
+- **Persistent config**: Enforces key/value settings in `httpd_config.conf`, re-applied automatically whenever Enhance overwrites the file
+- **503 fix**: Monitors per-site access logs for 503 spikes and triggers a PHP restart via the Enhance API when thresholds are met
+- **Redirect sync**: Syncs redirect rules created in the Enhance UI to the document root `.htaccess` for each domain
 
 ## Requirements
 
@@ -90,6 +85,7 @@ tail -f /var/log/webservertune-enhance/olstune.log
 tail -f /var/log/webservertune-enhance/ols503fix.log
 tail -f /var/log/webservertune-enhance/fastcgiclear.log
 tail -f /var/log/webservertune-enhance/nginxredirects.log
+tail -f /var/log/webservertune-enhance/olsredirects.log
 ```
 
 ## Configuration
@@ -115,6 +111,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
 | `nginx_restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 | `nginx_redirects` | `false` | Sync Enhance UI redirect rules to Nginx include files, per domain |
+| `ols_redirects` | `false` | Sync Enhance UI redirect rules to per-domain `.htaccess` files |
 | `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` and `backups/ols/` |
 
 ### Nginx
@@ -175,6 +172,7 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 | `ols503fix.log` | 503 detection events and PHP restart actions |
 | `fastcgiclear.log` | FastCGI cache clear events |
 | `nginxredirects.log` | Redirect sync events and rule translation warnings |
+| `olsredirects.log` | OLS redirect sync events and rule translation warnings |
 
 `INFO` is the recommended log level. `DEBUG` adds low-level inotify event detail.
 
@@ -213,11 +211,13 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
 
 ## Version History
 
-**0.4.0** — Nginx redirect sync from Enhance UI (`nginxredirects`).
+**0.5.0** — OLS redirect sync from Enhance UI.
 
-**0.3.0** — FastCGI cache clearing on WordPress update (`fastcgiclear`).
+**0.4.0** — Nginx redirect sync from Enhance UI.
 
-**0.2.1** — nginx systemd service restart management (`restart_manage`).
+**0.3.0** — FastCGI cache clearing on WordPress update.
+
+**0.2.1** — nginx systemd service restart management.
 
 **0.2.0** — Persistent webserver/php logging for OLS/Nginx.
 

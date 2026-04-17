@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""
+olsredirects
+Syncs redirect rules from the Enhance htaccess API to per-domain .htaccess
+files in each domain's document root, so OLS can read them natively.
+Triggered by inotify on /var/www/{uuid}/.htaccess (webspace root file).
+Called by webservertune-enhance main program.
+"""
+
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+WWW_DIR        = Path("/var/www")
+BACKUP_BASE    = Path("/opt/webservertune-enhance/backups/ols")
+HTACCESS_FILE  = ".htaccess"
+SENTINEL_BEGIN = "# BEGIN webservertune-redirects"
+SENTINEL_END   = "# END webservertune-redirects"
+
+UUID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE
+)
+
+
+# ---------------------------------------------------------------------------
+# Managed block helpers — used by both cleanup() and watch()
+# ---------------------------------------------------------------------------
+
+def _strip_managed_block(content):
+    """Remove the managed block from .htaccess content, preserving everything outside it."""
+    lines     = content.splitlines(keepends=True)
+    new_lines = []
+    in_block  = False
+    for line in lines:
+        s = line.strip()
+        if s == SENTINEL_BEGIN:
+            in_block = True
+            continue
+        if s == SENTINEL_END:
+            in_block = False
+            continue
+        if not in_block:
+            new_lines.append(line)
+    return "".join(new_lines)
+
+
+# ---------------------------------------------------------------------------
+# cleanup — always called at startup when OLS is detected
+# ---------------------------------------------------------------------------
+
+def cleanup(config, logger):
+    """Strip managed blocks from all .htaccess files under /var/www/."""
+    logger.info("olsredirects cleanup: scanning for managed blocks")
+    count = 0
+    try:
+        for entry in os.listdir(WWW_DIR):
+            if not UUID_RE.fullmatch(entry):
+                continue
+            uuid_dir = WWW_DIR / entry
+            for htaccess in uuid_dir.rglob(HTACCESS_FILE):
+                try:
+                    content = htaccess.read_text()
+                    if SENTINEL_BEGIN not in content:
+                        continue
+                    new_content = _strip_managed_block(content)
+                    if new_content != content:
+                        htaccess.write_text(new_content)
+                        count += 1
+                        logger.debug(f"Cleaned managed block from {htaccess}")
+                except Exception as e:
+                    logger.error(f"Failed to clean {htaccess}: {e}")
+    except Exception as e:
+        logger.error(f"Cleanup scan failed: {e}")
+    logger.info(f"olsredirects cleanup: removed managed blocks from {count} file(s)")
+
+
+# ---------------------------------------------------------------------------
+# watch — entry point when ols_redirects = true
+# ---------------------------------------------------------------------------
+
+def watch(config, logger):
+    """Entry point called by main program when ols_redirects is enabled."""
+    logger.info("olsredirects starting")
+
+    api           = config.get("api", {})
+    api_url       = api.get("enhance_url", "").rstrip("/")
+    master_org    = api.get("enhance_org_id", "")
+    api_token     = api.get("enhance_token", "")
+    general       = config.get("general", {})
+    debounce_secs = general.get("debounce_seconds", 10)
+
+    if not all([api_url, master_org, api_token]):
+        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
+        return
+
+    org_cache       = {}
+    org_cache_lock  = threading.Lock()
+    known_uuids     = set()
+    uuid_lock       = threading.Lock()
+    watcher_proc    = [None]
+    debounce_timers = {}
+    debounce_lock   = threading.Lock()
+
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+
+    def _get_webspace_pw(uuid):
+        """Return pwd entry for the system user owning the webspace directory."""
+        try:
+            stat = os.stat(WWW_DIR / uuid)
+            return pwd.getpwuid(stat.st_uid)
+        except Exception:
+            return None
+
+
+    # ---------------------------------------------------------------------------
+    # API
+    # ---------------------------------------------------------------------------
+
+    def _api_get(path):
+        """Perform a GET request against the Enhance API and return parsed JSON, or None on error."""
+        url = f"{api_url}{path}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP {e.code} for {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Request failed for {url}: {e}")
+            return None
+
+    def _build_org_cache():
+        """
+        Fetch all websites under the master org recursively and build a
+        {website_id: org_id} mapping. Paginates until all websites are retrieved.
+        """
+        websites = {}
+        offset   = 0
+        limit    = 100
+
+        while True:
+            data = _api_get(
+                f"/orgs/{master_org}/websites"
+                f"?recursion=infinite&offset={offset}&limit={limit}"
+            )
+            if data is None:
+                return
+            for site in data.get("items", []):
+                websites[site["id"]] = site["orgId"]
+            total = data.get("total", 0)
+            offset += limit
+            if offset >= total:
+                break
+
+        with org_cache_lock:
+            org_cache.clear()
+            org_cache.update(websites)
+        logger.info(f"Org cache built: {len(org_cache)} website(s)")
+
+    def _get_org_id(uuid):
+        """Return the org ID for a website UUID from the cache, or None if not found."""
+        with org_cache_lock:
+            return org_cache.get(uuid)
+
+
+    # ---------------------------------------------------------------------------
+    # Rule translation
+    # ---------------------------------------------------------------------------
+
+    def _extract_domain(cond_pattern):
+        """Extract bare domain name from a host condPattern like ^(www.)?example.com$"""
+        s = cond_pattern.lstrip("^")
+        if s.startswith("(www"):
+            idx = s.find(")?")
+            if idx != -1:
+                s = s[idx + 2:]
+        return s.rstrip("$").strip()
+
+    def _translate_rules(items):
+        """
+        Translate RewriteChain items to .htaccess RewriteRule blocks.
+        Returns dict of domain -> list of rule strings.
+        """
+        rules_by_domain = {}
+
+        for item in items:
+            conds = item.get("conds", [])
+            rule  = item.get("rule", {})
+
+            host_cond = next((c for c in conds if c.get("testString") == "%{HTTP_HOST}"), None)
+            uri_cond  = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
+
+            if not host_cond:
+                logger.warning(f"Skipping rule with missing host condition: {item}")
+                continue
+
+            domain       = _extract_domain(host_cond["condPattern"])
+            flags_str    = ",".join(rule.get("flags", []))
+            pattern      = rule.get("pattern", ".*")
+            substitution = rule.get("substitution", "")
+
+            rule_lines = [f'RewriteCond %{{HTTP_HOST}} {host_cond["condPattern"]} [NC]']
+
+            if uri_cond:
+                rule_lines.append(f'RewriteCond %{{REQUEST_URI}} {uri_cond["condPattern"]} [NC]')
+                # strip %{REQUEST_URI} — the URI condition already handles matching;
+                # leaving it in would append the source path to the target
+                substitution = substitution.replace("%{REQUEST_URI}", "")
+            else:
+                # catch-all: protect .well-known paths from being redirected
+                rule_lines.append("RewriteCond %{REQUEST_URI} !^/.well-known/ [NC]")
+
+            rule_lines.append(f"RewriteRule {pattern} {substitution} [{flags_str}]")
+
+            if domain not in rules_by_domain:
+                rules_by_domain[domain] = []
+            rules_by_domain[domain].append("\n".join(rule_lines))
+
+        return rules_by_domain
+
+
+    # ---------------------------------------------------------------------------
+    # Backup
+    # ---------------------------------------------------------------------------
+
+    def _backup_htaccess(htaccess_path, uuid):
+        """Back up a .htaccess file to a timestamped backup directory before modification."""
+        try:
+            doc_root = htaccess_path.parent.relative_to(WWW_DIR / uuid)
+        except ValueError:
+            doc_root = Path("unknown")
+        backup_path = (
+            BACKUP_BASE
+            / datetime.now().strftime("%Y%m%d_%H%M%S")
+            / uuid
+            / doc_root
+            / HTACCESS_FILE
+        )
+        try:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(htaccess_path, backup_path)
+            logger.debug(f"Backed up {htaccess_path} to {backup_path}")
+        except Exception as e:
+            logger.error(f"Failed to backup {htaccess_path}: {e}")
+
+
+    # ---------------------------------------------------------------------------
+    # .htaccess writing
+    # ---------------------------------------------------------------------------
+
+    def _write_htaccess(htaccess_path, rules, uuid):
+        """
+        Write or remove the managed block in a .htaccess file.
+        The managed block is always placed at the top of the file.
+        All content outside the block is preserved below it.
+        If rules is empty, the block is removed and remaining content written as-is.
+        """
+        try:
+            existing = htaccess_path.read_text() if htaccess_path.exists() else ""
+        except Exception as e:
+            logger.error(f"Failed to read {htaccess_path}: {e}")
+            return False
+
+        stripped = _strip_managed_block(existing)
+
+        if not rules:
+            if existing == stripped:
+                return False
+            _backup_htaccess(htaccess_path, uuid)
+            try:
+                htaccess_path.write_text(stripped)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to write {htaccess_path}: {e}")
+                return False
+
+        block_lines = [SENTINEL_BEGIN, "RewriteEngine On"]
+        for rule in rules:
+            block_lines.append(rule)
+        block_lines.append(SENTINEL_END)
+        block       = "\n".join(block_lines) + "\n"
+        new_content = block + stripped
+
+        if new_content == existing:
+            return False
+
+        if htaccess_path.exists():
+            _backup_htaccess(htaccess_path, uuid)
+
+        try:
+            htaccess_path.parent.mkdir(parents=True, exist_ok=True)
+            htaccess_path.write_text(new_content)
+            pw = _get_webspace_pw(uuid)
+            if pw:
+                os.chown(htaccess_path, pw.pw_uid, pw.pw_gid)
+                os.chmod(htaccess_path, 0o644)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write {htaccess_path}: {e}")
+            return False
+
+
+    # ---------------------------------------------------------------------------
+    # Sync
+    # ---------------------------------------------------------------------------
+
+    def _sync_uuid(uuid):
+        """
+        Fetch redirect rules for a UUID, translate, and write to per-domain
+        document root .htaccess files. Domains sharing a document root have
+        their rules merged into a single managed block.
+        """
+        org_id = _get_org_id(uuid)
+        if not org_id:
+            logger.debug(f"[{uuid}] Org not found in cache, skipping sync")
+            return
+
+        domains_data = _api_get(f"/orgs/{org_id}/websites/{uuid}/domains")
+        if domains_data is None:
+            return
+
+        htaccess_data = _api_get(f"/orgs/{org_id}/websites/{uuid}/htaccess")
+        if htaccess_data is None:
+            return
+
+        # build domain -> documentRoot mapping
+        domain_to_docroot = {}
+        for item in domains_data.get("items", []):
+            domain   = item.get("domain", "")
+            doc_root = item.get("documentRoot", "public_html")
+            if domain:
+                domain_to_docroot[domain] = doc_root
+
+        # translate rules grouped by domain
+        rules_by_domain = _translate_rules(htaccess_data.get("items", []))
+
+        # group translated rules by documentRoot — domains sharing a docroot are merged
+        docroot_rules = {}
+        for domain, rules in rules_by_domain.items():
+            doc_root = domain_to_docroot.get(domain)
+            if doc_root is None:
+                logger.debug(f"[{uuid}] No documentRoot for domain {domain}, skipping")
+                continue
+            if doc_root not in docroot_rules:
+                docroot_rules[doc_root] = []
+            docroot_rules[doc_root].extend(rules)
+
+        # write to all known document roots, including those with no rules (clears block)
+        for doc_root in set(domain_to_docroot.values()):
+            htaccess_path = WWW_DIR / uuid / doc_root / HTACCESS_FILE
+            rules         = docroot_rules.get(doc_root, [])
+            changed       = _write_htaccess(htaccess_path, rules, uuid)
+            if changed:
+                for domain, dr in domain_to_docroot.items():
+                    if dr != doc_root:
+                        continue
+                    domain_rules = rules_by_domain.get(domain, [])
+                    if domain_rules:
+                        logger.info(f"[{uuid}] [{domain}] Written {len(domain_rules)} redirect(s)")
+                    else:
+                        logger.info(f"[{uuid}] [{domain}] Cleared redirects")
+
+    def _schedule_sync(uuid):
+        """Schedule a debounced sync, cancelling any pending timer for the same UUID."""
+        with debounce_lock:
+            existing = debounce_timers.get(uuid)
+            if existing:
+                existing.cancel()
+            t = threading.Timer(debounce_secs, lambda: _sync_uuid(uuid))
+            debounce_timers[uuid] = t
+            t.start()
+        logger.debug(f"[{uuid}] Debounce timer reset ({debounce_secs}s)")
+
+
+    # ---------------------------------------------------------------------------
+    # UUID management
+    # ---------------------------------------------------------------------------
+
+    def _handle_uuid(uuid):
+        """Register a UUID and restart the htaccess watcher to pick up its directory."""
+        with uuid_lock:
+            if uuid in known_uuids:
+                return
+            known_uuids.add(uuid)
+        logger.debug(f"Registered: {uuid}")
+        _restart_htaccess_watcher()
+
+    def _restart_htaccess_watcher():
+        """Terminate the running inotifywait process so the watcher loop restarts it."""
+        proc = watcher_proc[0]
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+    # ---------------------------------------------------------------------------
+    # .htaccess watcher — reacts to CLOSE_WRITE on webspace root .htaccess
+    # ---------------------------------------------------------------------------
+
+    def _htaccess_watcher_loop():
+        """
+        Watch for CLOSE_WRITE, CREATE, and MOVED_TO on .htaccess directly in each UUID
+        directory (non-recursive). This catches changes Enhance makes to the webspace root
+        .htaccess without reacting to the document root .htaccess files this module writes to.
+        Restarts inotifywait whenever a new UUID is registered.
+        """
+        while True:
+            with uuid_lock:
+                paths = [str(WWW_DIR / u) for u in known_uuids if (WWW_DIR / u).exists()]
+
+            if not paths:
+                time.sleep(5)
+                continue
+
+            cmd = [
+                "inotifywait", "--monitor", "--quiet",
+                "--format", "%w %e %f",
+                "--event", "close_write",
+                "--event", "create",
+                "--event", "moved_to",
+            ] + paths
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                watcher_proc[0] = proc
+            except Exception as e:
+                logger.error(f"Failed to start htaccess inotifywait: {e}")
+                time.sleep(5)
+                continue
+
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 2)
+                if len(parts) != 3:
+                    continue
+                watch_dir, _, filename = parts
+                if filename != HTACCESS_FILE:
+                    continue
+                m = UUID_RE.search(watch_dir)
+                if not m:
+                    continue
+                uuid = m.group(0)
+                # confirm this is the webspace root directory, not a subdirectory
+                if watch_dir.rstrip("/") != str(WWW_DIR / uuid):
+                    continue
+                logger.info(f"[{uuid}] Webspace root .htaccess changed, scheduling sync")
+                _schedule_sync(uuid)
+
+            proc.wait()
+            watcher_proc[0] = None
+            logger.debug("htaccess inotifywait exited, restarting")
+            time.sleep(1)
+
+
+    # ---------------------------------------------------------------------------
+    # UUID discovery — watches /var/www/ for new webspace directories
+    # ---------------------------------------------------------------------------
+
+    def _uuid_discovery_loop():
+        """
+        Watch /var/www/ for new UUID directories and register them.
+        Startup scan is handled separately in _startup().
+        """
+        cmd = [
+            "inotifywait", "--monitor", "--quiet",
+            "--format", "%e %f",
+            "--event", "create",
+            "--event", "moved_to",
+            str(WWW_DIR),
+        ]
+
+        logger.info(f"Watching {WWW_DIR} for new UUID directories")
+
+        while True:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+            except FileNotFoundError:
+                logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
+                return
+            except Exception as e:
+                logger.error(f"UUID discovery inotifywait failed: {e}")
+                time.sleep(5)
+                continue
+
+            for line in proc.stdout:
+                parts = line.strip().split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                _, name = parts
+                if UUID_RE.fullmatch(name):
+                    logger.info(f"New UUID directory detected: {name}")
+                    # brief delay to allow Enhance to finish setting up the webspace
+                    time.sleep(5)
+                    _handle_uuid(name)
+                    _schedule_sync(name)
+
+            proc.wait()
+            logger.warning("UUID discovery inotifywait exited, restarting in 5s")
+            time.sleep(5)
+
+
+    # ---------------------------------------------------------------------------
+    # Startup
+    # ---------------------------------------------------------------------------
+
+    def _startup():
+        """
+        Build org cache, register all current UUID directories, and sync
+        redirect rules for all sites in parallel.
+        """
+        _build_org_cache()
+
+        try:
+            for entry in os.listdir(WWW_DIR):
+                if UUID_RE.fullmatch(entry):
+                    _handle_uuid(entry)
+        except Exception as e:
+            logger.error(f"Startup UUID scan failed: {e}")
+
+        with uuid_lock:
+            startup_uuids = list(known_uuids)
+
+        def _sync_one(uuid):
+            try:
+                _sync_uuid(uuid)
+            except Exception as e:
+                logger.error(f"[{uuid}] Startup sync failed: {e}")
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            executor.map(_sync_one, startup_uuids)
+
+        logger.info("Startup sync complete")
+
+
+    # ---------------------------------------------------------------------------
+    # Start
+    # ---------------------------------------------------------------------------
+
+    threading.Thread(target=_htaccess_watcher_loop, daemon=True).start()
+    threading.Thread(target=_uuid_discovery_loop, daemon=True).start()
+    _startup()
+
+    while True:
+        time.sleep(60)

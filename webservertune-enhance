@@ -179,6 +179,18 @@ def main():
             )
             t2.start()
 
+        olsredirects     = load_module("olsredirects")
+        ols_redir_logger = setup_logger("olsredirects", log_level)
+        olsredirects.cleanup(config, ols_redir_logger)
+
+        if config.get("general", {}).get("ols_redirects", False):
+            t3 = threading.Thread(
+                target=olsredirects.watch,
+                args=(config, ols_redir_logger),
+                daemon=True
+            )
+            t3.start()
+
     def watch_config():
         """Watch for settings.conf changes and exit so systemd restarts the service."""
         cmd = [

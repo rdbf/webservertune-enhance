@@ -362,9 +362,10 @@ def watch(config, logger):
 
         # write to all known document roots, including those with no rules (clears block)
         for doc_root in set(domain_to_docroot.values()):
-            htaccess_path = WWW_DIR / uuid / doc_root / HTACCESS_FILE
-            rules         = docroot_rules.get(doc_root, [])
-            changed       = _write_htaccess(htaccess_path, rules, uuid)
+            htaccess_path  = WWW_DIR / uuid / doc_root / HTACCESS_FILE
+            rules          = docroot_rules.get(doc_root, [])
+            changed        = _write_htaccess(htaccess_path, rules, uuid)
+            docroot_has_rules = bool(rules)
             if changed:
                 for domain, dr in domain_to_docroot.items():
                     if dr != doc_root:
@@ -372,7 +373,7 @@ def watch(config, logger):
                     domain_rules = rules_by_domain.get(domain, [])
                     if domain_rules:
                         logger.info(f"[{uuid}] [{domain}] Written {len(domain_rules)} redirect(s)")
-                    else:
+                    elif not docroot_has_rules:
                         logger.info(f"[{uuid}] [{domain}] Cleared redirects")
 
     def _schedule_sync(uuid):

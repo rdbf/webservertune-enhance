@@ -356,7 +356,7 @@ def _enforce_general(lines, desired, logger):
                     current_val = parts[1].strip()
                     if current_val != val_out:
                         new_lines.append(f"{indent}{key_out:<26}{val_out}\n")
-                        logger.info(f"  AMENDED  {key_out}: '{current_val}' -> '{val_out}'")
+                        logger.info(f"  TO AMEND  {key_out}: '{current_val}' -> '{val_out}'")
                         changed = True
                         continue
 
@@ -373,7 +373,7 @@ def _enforce_general(lines, desired, logger):
     for key_lower, (key_out, val_out) in desired_lower.items():
         if key_lower not in keys_seen:
             inserts.append(f"        {key_out:<26}{val_out}\n")
-            logger.info(f"  INSERTED {key_out} = {val_out}")
+            logger.info(f"  TO INSERT {key_out} = {val_out}")
             changed = True
 
     if inserts:
@@ -429,7 +429,7 @@ def _enforce_block(lines, target_block, desired, logger):
                 for key_lower, (key_out, val_out) in desired_lower.items():
                     if key_lower not in keys_seen:
                         inserts.append(f"{block_indent}{key_out:<24}{val_out}\n")
-                        logger.info(f"  INSERTED {key_out} = {val_out}")
+                        logger.info(f"  TO INSERT {key_out} = {val_out}")
                         changed = True
 
                 if inserts:
@@ -453,7 +453,7 @@ def _enforce_block(lines, target_block, desired, logger):
                     if current_val != val_out:
                         indent = line[: len(line) - len(line.lstrip())]
                         new_lines.append(f"{indent}{key_out:<24}{val_out}\n")
-                        logger.info(f"  AMENDED  {key_out}: '{current_val}' -> '{val_out}'")
+                        logger.info(f"  TO AMEND  {key_out}: '{current_val}' -> '{val_out}'")
                         changed = True
                         i += 1
                         continue

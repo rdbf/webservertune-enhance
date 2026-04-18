@@ -8,40 +8,42 @@
 
 webservertune-enhance is an automated configuration service for Enhance hosting control panel servers that handles both Nginx and OpenLiteSpeed webservers. It monitors for configuration changes and re-applies settings automatically without manual intervention, adding features and resolving limitations in how Enhance implements each webserver.
 
-Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.21.1.
+Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.21.3.
 
 ## Features
 
 ### General
 - Single config file and service for both Nginx and OpenLiteSpeed
+- Modifications applied server-wide for all websites
 - Reversible changes via feature toggles — disable a feature to undo its changes
 - Targeted processing — only modifies files when changes are actually needed
 - Webserver transition detection — monitors for switches between Nginx and OLS and reloads automatically
 - Automatic timestamped backups before any change, with rollback on failure
-- **Persistent logging**: Per-site webserver access logs written to `/var/www/<UUID>/logs/webserver.log`, for both Nginx and OLS
-- **PHP log persistence**: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
+- Persistent logging: Per-site webserver access logs written to `/var/www/<UUID>/logs/webserver.log`, for both Nginx and OLS
+- PHP log persistence: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
 
 ### Nginx
-- **HTTP/3**: QUIC listeners, Alt-Svc headers, and FastCGI HTTP_HOST fix, with optional QUIC Generic Segmentation Offloading (GSO)
-- **Security directives**: SSL, server hardening, and basic CMS/WordPress protection improvements, applied across all sites on the server
-- **Persistent logging**: Per-site access logs with optional Cloudflare real IP detection
-- **FastCGI cache**: Configurable inactive timeout and cache validity period
-- **FastCGI cache clearing**: Clears Nginx FastCGI cache via the Enhance API when a WordPress update completes
-- **Client Max Body Size**: Configurable maximum upload and request body size
-- **Redirect sync**: Syncs redirect rules created in the Enhance UI to Nginx, per domain
+- HTTP/3: QUIC listeners, Alt-Svc headers with FastCGI HTTP_HOST, optional QUIC Generic Segmentation Offloading (GSO)
+- Security directives: Secure SSL/TLS versions, basic hardening, and basic CMS/WordPress protection
+- Persistent logging: Per-site access logs with optional Cloudflare real IP detection
+- FastCGI cache settings: Configurable inactive timeout and cache validity period
+- FastCGI clearing: Clear Nginx FastCGI cache via the Enhance API when a WordPress update completes
+- Client Max Body Size: Configurable maximum upload and request body size
+- Redirects: Syncs and fixes redirect rules created in the Enhance UI to Nginx, per domain
+- Systemd service: Adds config to fix default restart behaviour (5x max, then "dead forever") to keep restarting at slower pace forever
 
 ### OLS
-- **Persistent config**: Enforces key/value settings in `httpd_config.conf`, re-applied automatically whenever Enhance overwrites the file
-- **503 fix**: Monitors per-site access logs for 503 spikes and triggers a PHP restart via the Enhance API when thresholds are met
-- **Redirect sync**: Syncs redirect rules created in the Enhance UI to the document root `.htaccess` for each domain
+- Persistent config: Enforces key/value settings in `httpd_config.conf`, re-applied automatically whenever Enhance overwrites the file
+- 503 fixer: Monitors logs for http-503 spikes and triggers a PHP restart via the Enhance API when thresholds are met for a domain
+- Redirects: Syncs and fixes redirect rules created in the Enhance UI to the relevant `.htaccess` file for each domain
 
 ## Requirements
 
 - Root access
 - Enhance hosting environment
-- Python 3.11+
+- Python 3.11+ (default on Ubuntu 24.04)
 - inotify-tools: `apt install inotify-tools`
-- Nginx with HTTP/3 support compiled in (Enhance Nginx 1.28.0 includes this)
+- Enhance installed updated Nginx (1.28.0) or OpenLiteSpeed (1.8.5)
 
 ## Installation
 
@@ -81,10 +83,10 @@ tail -f /var/log/webservertune-enhance/*.log
 # Follow individual logs
 tail -f /var/log/webservertune-enhance/webservertune-enhance.log
 tail -f /var/log/webservertune-enhance/nginxtune.log
+tail -f /var/log/webservertune-enhance/nginxredirects.log
+tail -f /var/log/webservertune-enhance/fastcgiclear.log
 tail -f /var/log/webservertune-enhance/olstune.log
 tail -f /var/log/webservertune-enhance/ols503fix.log
-tail -f /var/log/webservertune-enhance/fastcgiclear.log
-tail -f /var/log/webservertune-enhance/nginxredirects.log
 tail -f /var/log/webservertune-enhance/olsredirects.log
 ```
 
@@ -105,12 +107,12 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_level` | `INFO` | `DEBUG` (everything), `INFO` (normal operations), `WARNING` (errors only) |
-| `debounce_seconds` | `10` | Seconds to wait after a file change before acting, to avoid reacting to partial writes |
+| `debounce_seconds` | `10` | Seconds to wait after a file change before acting, to avoid reacting to partial writes - increase for servers with more sites |
 | `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/www/<UUID>/logs/webserver.log`. Applies to both Nginx and OLS. |
 | `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
-| `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
 | `nginx_restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 | `nginx_redirects` | `false` | Sync Enhance UI redirect rules to Nginx include files, per domain |
+| `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
 | `ols_redirects` | `false` | Sync Enhance UI redirect rules to per-domain `.htaccess` files |
 | `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` and `backups/ols/` |
 
@@ -118,10 +120,10 @@ All settings are controlled through `settings.conf` in TOML format. All features
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `http3_enable` | `false` | HTTP/3 support: QUIC listeners, Alt-Svc headers, FastCGI HTTP_HOST fix |
+| `http3_enable` | `false` | HTTP/3 support: QUIC listeners, Alt-Svc headers, FastCGI HTTP_HOST |
 | `quic_gso_enable` | `false` | QUIC Generic Segmentation Offloading — requires `http3_enable = true` |
 | `ssl_upgrade` | `false` | Include `overrides/ssl.conf` — modern TLS settings |
-| `server_hardening` | `false` | Include `overrides/hardening.conf` — server hardening rules |
+| `server_hardening` | `false` | Include `overrides/hardening.conf` — basic server hardening rules |
 | `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
 | `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` in `[general]` |
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
@@ -132,11 +134,11 @@ All settings are controlled through `settings.conf` in TOML format. All features
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `false` | Load and start the fastcgiclear module — Nginx only |
+| `enabled` | `false` | Load and start the fastcgiclear module — Nginx only. Installs mu-plugin that catches update notifications and sets a flag for cache clearing |
 
 ### OLS Webserver Settings
 
-Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `[ols.general]` and named blocks such as `[ols.tuning]`. Block names must match exactly as they appear in `httpd_config.conf`. Several commented-out example values are included in `settings.conf.example` for reference.
+Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `[ols.general]` and named blocks such as `[ols.tuning]`. Block names must match exactly as they appear in `httpd_config.conf`. Several commented-out example values are included in `settings.conf.example` for reference. OLS in Enhance ignores / overrides some sections (like LSPHP) and other settings won't work at all due to the way OLS is implemented by Enhance.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -146,45 +148,35 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `window_seconds` | `30` | Sliding window in seconds for 503 counting |
-| `min_503_count` | `5` | Minimum 503 count within the window before evaluating a restart |
+| `window_seconds` | `30` | Sliding window in seconds for http-503 counting |
+| `min_503_count` | `5` | Minimum http-503 count within the window before evaluating a restart |
 | `min_503_percent` | `50` | Minimum percentage of recent requests that must be 503s to trigger a restart |
 | `last_n_requests` | `10` | Request sample size for percentage calculation |
-| `cooldown_seconds` | `60` | Minimum time between restarts for the same site |
+| `cooldown_seconds` | `60` | Minimum time between restarts for the same site to avoid rapid restart repeats |
 | `scan_interval` | `1` | Log polling interval in seconds |
 
 ## Backup System
 
 - **Location**: `/opt/webservertune-enhance/backups/`
-- **Validation**: Tests Nginx configuration with `nginx -t` before applying changes
-- **Rollback**: Restores from backup and reloads if validation or reload fails, then restarts the service to re-attempt
-- **Retention**: Configurable via `backup_retention_days` in `[general]` (default 30 days), applies to both Nginx and OLS
+- **Validation**: Tests Nginx configuration with `nginx -t` before applying changes, checks OLS active state after applying changes
+- **Rollback**: Restores from backup and reloads / restarts if validation or reload fails
+- **Retention**: Configurable via `backup_retention_days` in `[general]`, applies to both Nginx and OLS
 
 ## Logging
 
 Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 
-| File | Content |
-|------|---------|
-| `webservertune-enhance.log` | Startup, webserver detection, transitions |
-| `nginxtune.log` | Nginx config changes, reloads, backups |
-| `olstune.log` | OLS config enforcement, backups, restarts |
-| `ols503fix.log` | 503 detection events and PHP restart actions |
-| `fastcgiclear.log` | FastCGI cache clear events |
-| `nginxredirects.log` | Redirect sync events and rule translation warnings |
-| `olsredirects.log` | OLS redirect sync events and rule translation warnings |
-
-`INFO` is the recommended log level. `DEBUG` adds low-level inotify event detail.
+`INFO` is the default log level. `DEBUG` can add low-level inotify event detail.
 
 ### Persistent Logging
 
-When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is also enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
+When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
 
 When `persistent_php_logs` is enabled, PHP logs are written to `/var/www/<UUID>/logs/php.log` - php-error.log for both webservers and php-fpm.log for Nginx.
 
 ### Log Rotation
 
-Create `/etc/logrotate.d/webservertune-enhance` with the following:
+If log rotation is desired, create `/etc/logrotate.d/webservertune-enhance` with the following:
 
 ```
 /var/log/webservertune-enhance/*.log
@@ -202,12 +194,17 @@ Create `/etc/logrotate.d/webservertune-enhance` with the following:
    copytruncate
 }
 ```
+Adjust settings as required, as this config saves 15 weekly logs.
+
+## Bugs, feature requests, fixes
+
+- Please report any issues with functionality, or if you'd like to see an existing OLS/Nginx issue with Enhance fixed, if possible. The software has been tested and running on several Enhance clusters for a few months, but different clusters can have different designs and modifications, so it might behave unexpectedly.
 
 ## Known Issues
 
 - The Nginx version that Enhance ships is built against an old OpenSSL version (v3.0.13 - 30 Jan 2024), meaning that quic/http3 performance will be poor at best.
-- The CMS overrides can cause issues with the Enhance file manager when applied on the control panel. They can also prevent ClientExec from completing automated version updates.
-- Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied and log an error.
+- The CMS overrides can cause issues with the Enhance file manager when applied on the control panel, or block certain functionalities of your CMS.
+- Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
 

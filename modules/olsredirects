@@ -148,29 +148,41 @@ def watch(config, logger):
         """
         Fetch all websites under the master org recursively and build a
         {website_id: org_id} mapping. Paginates until all websites are retrieved.
+        Retries up to 5 times with a 60s delay to handle control panel startup lag.
         """
-        websites = {}
-        offset   = 0
-        limit    = 100
+        for attempt in range(1, 6):
+            websites = {}
+            offset   = 0
+            limit    = 100
+            failed   = False
 
-        while True:
-            data = _api_get(
-                f"/orgs/{master_org}/websites"
-                f"?recursion=infinite&offset={offset}&limit={limit}"
-            )
-            if data is None:
+            while True:
+                data = _api_get(
+                    f"/orgs/{master_org}/websites"
+                    f"?recursion=infinite&offset={offset}&limit={limit}"
+                )
+                if data is None:
+                    failed = True
+                    break
+                for site in data.get("items", []):
+                    websites[site["id"]] = site["orgId"]
+                total = data.get("total", 0)
+                offset += limit
+                if offset >= total:
+                    break
+
+            if not failed:
+                with org_cache_lock:
+                    org_cache.clear()
+                    org_cache.update(websites)
+                logger.info(f"Org cache built: {len(org_cache)} website(s)")
                 return
-            for site in data.get("items", []):
-                websites[site["id"]] = site["orgId"]
-            total = data.get("total", 0)
-            offset += limit
-            if offset >= total:
-                break
 
-        with org_cache_lock:
-            org_cache.clear()
-            org_cache.update(websites)
-        logger.info(f"Org cache built: {len(org_cache)} website(s)")
+            if attempt < 5:
+                logger.warning(f"Org cache build failed (attempt {attempt}/5), retrying in 60s")
+                time.sleep(60)
+
+        logger.error("Org cache build failed after 5 attempts, startup sync will be skipped")
 
     def _get_org_id(uuid):
         """Return the org ID for a website UUID from the cache, or None if not found."""

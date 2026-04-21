@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.5.0  
+**Version:** 0.5.1  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -23,7 +23,8 @@ Future Enhance updates might break functionality, although checks are in place t
 - PHP log persistence: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
 
 ### Nginx
-- HTTP/3: QUIC listeners, Alt-Svc headers with FastCGI HTTP_HOST, optional QUIC Generic Segmentation Offloading (GSO)
+- HTTP/3: QUIC listeners, Alt-Svc headers, and FastCGI HTTP_HOST in website vhosts
+- QUIC directives: quic_bpf, quic_gso, quic_retry, and ssl_early_data managed in nginx.conf
 - Security directives: Secure SSL/TLS versions, basic hardening, and basic CMS/WordPress protection
 - Persistent logging: Per-site access logs with optional Cloudflare real IP detection
 - FastCGI cache settings: Configurable inactive timeout and cache validity period
@@ -63,6 +64,8 @@ cd /opt/webservertune-enhance
 git pull
 systemctl restart webservertune-enhance
 ```
+
+If the version history notes "Config format changed", update `settings.conf` manually before restarting, otherwise the service will fail to start.
 
 ### Migration from nginxtune-enhance
 
@@ -121,7 +124,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `http3_enable` | `false` | HTTP/3 support: QUIC listeners, Alt-Svc headers, FastCGI HTTP_HOST |
-| `quic_gso_enable` | `false` | QUIC Generic Segmentation Offloading — requires `http3_enable = true` |
+| `quic_directives_enable` | `false` | QUIC performance directives written to nginx.conf — requires `http3_enable = true` |
 | `ssl_upgrade` | `false` | Include `overrides/ssl.conf` — modern TLS settings |
 | `server_hardening` | `false` | Include `overrides/hardening.conf` — basic server hardening rules |
 | `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
@@ -207,6 +210,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.5.1** — QUIC directives moved to nginx.conf, including quic_gso. Config format changed.
 
 **0.5.0** — OLS redirect sync from Enhance UI.
 

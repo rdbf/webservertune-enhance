@@ -16,12 +16,16 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-SITES_DIR    = Path("/etc/nginx/sites-enabled")
-BACKUP_BASE  = Path("/opt/webservertune-enhance/backups/nginx")
-OVERRIDES    = Path("/opt/webservertune-enhance/overrides")
+SITES_DIR     = Path("/etc/nginx/sites-enabled")
+NGINX_CONF    = Path("/etc/nginx/nginx.conf")
+BACKUP_BASE   = Path("/opt/webservertune-enhance/backups/nginx")
+OVERRIDES     = Path("/opt/webservertune-enhance/overrides")
 REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
-NGINX_DROPIN = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
-ALT_SVC      = 'h3=":443"; ma=86400'
+NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
+ALT_SVC       = 'h3=":443"; ma=86400'
+
+SENTINEL_BEGIN = "# Custom nginxtune config"
+SENTINEL_END   = "# End custom nginxtune config"
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +139,8 @@ def _apply_restart_manage(config, logger):
 
 def run(config, logger):
     """
-    Back up all vhost confs, apply all configured features, test with nginx -t,
-    reload nginx if changed, or restore from backup and exit if reload fails.
+    Back up all vhost confs and nginx.conf, apply all configured features, test with
+    nginx -t, reload nginx if changed, or restore from backup and exit if reload fails.
     """
     backup_dir = _create_backup(logger)
     if not backup_dir:
@@ -144,6 +148,7 @@ def run(config, logger):
         return
 
     changed  = False
+    changed |= apply_nginx_conf(config, logger)
     changed |= apply_http3_enable(config, logger)
     changed |= apply_quic_gso_enable(config, logger)
     changed |= apply_include_features(config, logger)
@@ -188,12 +193,17 @@ def run(config, logger):
 # ---------------------------------------------------------------------------
 
 def _create_backup(logger):
-    """Copy all vhost confs to a timestamped backup directory. Returns the path or None on failure."""
+    """
+    Copy all vhost confs and nginx.conf to a timestamped backup directory.
+    Returns the path or None on failure.
+    """
     backup_dir = BACKUP_BASE / datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
         for f in SITES_DIR.glob("*.conf"):
             shutil.copy2(f, backup_dir)
+        if NGINX_CONF.exists():
+            shutil.copy2(NGINX_CONF, backup_dir / NGINX_CONF.name)
         logger.info(f"Backup created: {backup_dir}")
         return backup_dir
     except Exception as e:
@@ -202,10 +212,13 @@ def _create_backup(logger):
 
 
 def _restore_backup(backup_dir, logger):
-    """Restore vhost confs from a backup directory. Returns True on success."""
+    """Restore vhost confs and nginx.conf from a backup directory. Returns True on success."""
     try:
         for f in backup_dir.glob("*.conf"):
-            shutil.copy2(f, SITES_DIR / f.name)
+            if f.name == NGINX_CONF.name:
+                shutil.copy2(f, NGINX_CONF)
+            else:
+                shutil.copy2(f, SITES_DIR / f.name)
         logger.info(f"Restored from backup: {backup_dir}")
         return True
     except Exception as e:
@@ -292,6 +305,90 @@ def _php_indent(lines, index, fallback="                "):
         return " " * (n + 4)
     except Exception:
         return fallback
+
+
+# ---------------------------------------------------------------------------
+# apply_nginx_conf
+# ---------------------------------------------------------------------------
+
+def apply_nginx_conf(config, logger):
+    """
+    Manage Custom nginxtune config sentinel blocks in nginx.conf.
+    Main context block: quic_bpf on (inserted before events {}).
+    http context block: quic_gso on, quic_retry on, ssl_early_data on
+    (inserted at the top of http {}).
+    Both blocks are stripped and rebuilt on every run.
+    quic_directives_enable requires http3_enable = true to be effective.
+    """
+    if not NGINX_CONF.exists():
+        logger.error(f"nginx.conf not found: {NGINX_CONF}")
+        return False
+
+    features  = config.get("nginx", {}).get("features", {})
+    effective = features.get("quic_directives_enable", False) and features.get("http3_enable", False)
+
+    try:
+        original = NGINX_CONF.read_text()
+        lines    = original.splitlines(keepends=True)
+    except Exception as e:
+        logger.error(f"Failed to read nginx.conf: {e}")
+        return False
+
+    # strip all existing sentinel blocks
+    stripped = []
+    in_block = False
+    for line in lines:
+        s = line.strip()
+        if s == SENTINEL_BEGIN:
+            in_block = True
+            continue
+        if s == SENTINEL_END:
+            in_block = False
+            continue
+        if not in_block:
+            stripped.append(line)
+
+    # rebuild with sentinel blocks inserted at the correct positions
+    result        = []
+    main_inserted = False
+    http_inserted = False
+
+    for line in stripped:
+        s = line.strip()
+
+        # main context block goes before events {
+        if not main_inserted and s.startswith("events") and "{" in s:
+            if effective:
+                result.append(f"{SENTINEL_BEGIN}\n")
+                result.append("quic_bpf on;\n")
+                result.append(f"{SENTINEL_END}\n")
+            main_inserted = True
+
+        result.append(line)
+
+        # http context block goes at the top of http {
+        if not http_inserted and s == "http {":
+            if effective:
+                result.append(f"\t{SENTINEL_BEGIN}\n")
+                result.append("\tquic_gso on;\n")
+                result.append("\tquic_retry on;\n")
+                result.append("\tssl_early_data on;\n")
+                result.append(f"\t{SENTINEL_END}\n")
+            http_inserted = True
+
+    new_content = "".join(result)
+
+    if new_content == original:
+        return False
+
+    try:
+        NGINX_CONF.write_text(new_content)
+        action = "enabled" if effective else "disabled"
+        logger.warning(f"apply_nginx_conf: quic directives {action} — updated nginx.conf")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to write nginx.conf: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -475,14 +572,11 @@ def apply_http3_enable(config, logger):
 
 def apply_quic_gso_enable(config, logger):
     """
-    Add or remove the quic_gso on directive across all vhost confs.
-    Only effective when http3_enable is also true.
+    Remove quic_gso on from all vhost confs unconditionally.
+    quic_gso and related QUIC directives are managed in nginx.conf by apply_nginx_conf().
     """
-    features      = config.get("nginx", {}).get("features", {})
-    # quic_gso requires http3 to be enabled; force off if http3 is disabled
-    effective     = features.get("quic_gso_enable", False) and features.get("http3_enable", False)
-    conf_files    = _site_confs()
-    any_changed   = False
+    conf_files  = _site_confs()
+    any_changed = False
 
     for cf in conf_files:
         filename = cf.name
@@ -494,29 +588,13 @@ def apply_quic_gso_enable(config, logger):
             continue
 
         has_gso = any(l.strip() == "quic_gso on;" for l in lines)
-        if has_gso == effective:
+        if not has_gso:
             continue
 
-        new_lines   = []
-        gso_added   = False
-
-        for i, line in enumerate(lines):
-            s = line.strip()
-
-            if s == "quic_gso on;" and not effective:
-                continue
-            elif s.startswith("server_name") and not s.startswith("#") and effective and not gso_added:
-                new_lines.append(line)
-                new_lines.append(f"{_indent(lines, i)}quic_gso on;\n")
-                gso_added = True
-                continue
-            else:
-                new_lines.append(line)
-
+        new_lines = [l for l in lines if l.strip() != "quic_gso on;"]
         try:
             cf.write_text("".join(new_lines))
-            action = "enabled" if effective else "disabled"
-            logger.warning(f"quic_gso_enable: {action} — updated {filename}")
+            logger.warning(f"quic_directives_enable: removed quic_gso from vhost — {filename}")
             any_changed = True
         except Exception as e:
             logger.error(f"Failed to write {filename}: {e}")

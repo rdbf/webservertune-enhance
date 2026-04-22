@@ -179,6 +179,16 @@ def main():
             )
             t2.start()
 
+        if config.get("ols-lsapi", {}).get("enabled", False):
+            olslsapi     = load_module("olslsapi")
+            lsapi_logger = setup_logger("olslsapi", log_level)
+            t_lsapi      = threading.Thread(
+                target=olslsapi.run,
+                args=(config, lsapi_logger, site_watcher),
+                daemon=True
+            )
+            t_lsapi.start()
+
         olsredirects     = load_module("olsredirects")
         ols_redir_logger = setup_logger("olsredirects", log_level)
         olsredirects.cleanup(config, ols_redir_logger)

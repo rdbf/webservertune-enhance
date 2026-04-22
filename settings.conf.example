@@ -64,3 +64,8 @@ min_503_percent  = 50
 last_n_requests  = 10
 cooldown_seconds = 60
 scan_interval    = 1
+
+[ols-lsapi]
+enabled              = false
+children_below_nproc = 3
+interval_seconds     = 21600

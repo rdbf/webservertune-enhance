@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.5.1  
+**Version:** 0.5.2  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -37,6 +37,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Persistent config: Enforces key/value settings in `httpd_config.conf`, re-applied automatically whenever Enhance overwrites the file
 - 503 fixer: Monitors logs for http-503 spikes and triggers a PHP restart via the Enhance API when thresholds are met for a domain
 - Redirects: Syncs and fixes redirect rules created in the Enhance UI to the relevant `.htaccess` file for each domain
+- LSPHP setting: Sets LSAPI_CHILDREN per site via the Enhance API based on its NPROC cgroup limit
 
 ## Requirements
 
@@ -91,6 +92,7 @@ tail -f /var/log/webservertune-enhance/fastcgiclear.log
 tail -f /var/log/webservertune-enhance/olstune.log
 tail -f /var/log/webservertune-enhance/ols503fix.log
 tail -f /var/log/webservertune-enhance/olsredirects.log
+tail -f /var/log/webservertune-enhance/olslsapi.log
 ```
 
 ## Configuration
@@ -158,6 +160,14 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 | `cooldown_seconds` | `60` | Minimum time between restarts for the same site to avoid rapid restart repeats |
 | `scan_interval` | `1` | Log polling interval in seconds |
 
+### OLS LSPHP Setting
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Load and start the olslsapi module — OLS only |
+| `children_below_nproc` | `3` | lsapiChildren is set to nproc minus this value |
+| `interval_seconds` | `21600` | How often to re-check and update all sites |
+
 ## Backup System
 
 - **Location**: `/opt/webservertune-enhance/backups/`
@@ -210,6 +220,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.5.2** — Set LSAPI_CHILDREN per site based on NPROC cgroup limit. Config format changed.
 
 **0.5.1** — QUIC directives moved to nginx.conf, including quic_gso. Config format changed.
 

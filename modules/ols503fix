@@ -21,14 +21,9 @@ LOG_PATTERN = re.compile(r'"([^"]*)"')
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run(config, logger, site_watcher):
-    """Entry point called by main program. Merges API config into module config and starts processing."""
-    cfg     = config.get("ols-503fix", {})
-    api     = config.get("api", {})
-
-    # merge API credentials into cfg so they're accessible throughout the module
-    for key in ("enhance_url", "enhance_org_id", "enhance_token"):
-        cfg[key] = api.get(key, "")
+def run(config, logger, site_watcher, api_client):
+    """Entry point called by main program."""
+    cfg = config.get("ols-503fix", {})
 
     logger.info(
         f"ols503fix starting — window={cfg.get('window_seconds', 30)}s, "
@@ -38,7 +33,7 @@ def run(config, logger, site_watcher):
         f"cooldown={cfg.get('cooldown_seconds', 60)}s"
     )
 
-    registry = SiteRegistry(cfg, logger)
+    registry = SiteRegistry(cfg, logger, api_client)
     site_watcher.register_consumer(registry.add_site, registry.remove_site)
 
     while True:
@@ -76,8 +71,6 @@ class SiteState:
         # separate 24h deque so long-term counts survive the short sliding window prune
         self.errors_503_24h = deque()
         self.last_restart   = 0.0
-        self._domain        = None
-        self._domain_ts     = 0.0
 
     def record(self, status_code):
         """Record a request, appending timestamp to the relevant deques."""
@@ -154,18 +147,6 @@ class SiteState:
         self.last_restart = time.time()
         self.all_requests.clear()
         self.errors_503.clear()
-
-    def get_domain(self, config, logger):
-        """Return the primary domain for this site, using a 5-minute cache to reduce API calls."""
-        now = time.time()
-        if self._domain is not None and now - self._domain_ts < 300:
-            logger.debug(f"[{self.website_id}] Using cached domain: {self._domain}")
-            return self._domain
-        domain = _get_primary_domain(self.website_id, config, logger)
-        if domain is not None:
-            self._domain    = domain
-            self._domain_ts = now
-        return domain
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +226,13 @@ class FileWatcher:
 class SiteRegistry:
     """Manages per-site FileWatcher and SiteState instances, driven by OLSSiteWatcher callbacks."""
 
-    def __init__(self, config, logger):
-        self.config   = config
-        self.logger   = logger
-        self.watchers = {}
-        self.states   = {}
-        self._lock    = threading.Lock()
+    def __init__(self, config, logger, api_client):
+        self.config      = config
+        self.logger      = logger
+        self._api_client = api_client
+        self.watchers    = {}
+        self.states      = {}
+        self._lock       = threading.Lock()
 
     def add_site(self, wid):
         """Register a new site, creating a FileWatcher and SiteState for it."""
@@ -303,7 +285,7 @@ class SiteRegistry:
                     f"{self.config.get('window_seconds', 30)}s window, "
                     f"{pct:.0f}% of last {self.config.get('last_n_requests', 10)} requests"
                 )
-                domain = state.get_domain(self.config, self.logger)
+                domain = self._api_client.get_primary_domain(wid, self.logger)
                 if domain is not None:
                     probe = _probe_site(domain)
                     if probe is not None:
@@ -315,7 +297,7 @@ class SiteRegistry:
                     else:
                         self.logger.info(f"[{wid}] Probe of {domain} timed out — triggering PHP restart")
                 self.logger.info(f"[{wid}] Restarting PHP")
-                success = _restart_php(wid, self.config, self.logger)
+                success = _restart_php(wid, self._api_client, self.logger)
                 state.mark_restarted()
                 if success:
                     self.logger.info(f"[{wid}] PHP restart confirmed")
@@ -327,32 +309,22 @@ class SiteRegistry:
 # Enhance API
 # ---------------------------------------------------------------------------
 
-def _get_primary_domain(website_id, config, logger):
-    """Fetch the primary domain for a website from the Enhance API. Returns None on failure."""
-    org_id = config.get("enhance_org_id", "")
-    if not org_id:
-        logger.warning(f"[{website_id}] enhance_org_id not set — skipping domain probe")
-        return None
-    url     = f"{config.get('enhance_url', '').rstrip('/')}/orgs/{org_id}/websites/{website_id}/domains"
-    headers = {"Authorization": f"Bearer {config.get('enhance_token', '')}"}
-    logger.debug(f"[{website_id}] Domain lookup URL: {url}")
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            logger.warning(f"[{website_id}] Domain lookup returned {resp.status_code} for {url} — skipping probe")
-            return None
-        items = resp.json().get("items", [])
-        for item in items:
-            if item.get("mappingKind") == "primary":
-                domain = item.get("domain")
-                logger.debug(f"[{website_id}] Primary domain found: {domain}")
-                return domain
-        logger.warning(f"[{website_id}] No primary domain found — skipping probe")
-        return None
-    except requests.RequestException as e:
-        logger.warning(f"[{website_id}] Domain lookup failed: {e} — skipping probe")
-        return None
+def _restart_php(website_id, api_client, logger):
+    """Trigger a PHP restart for the website via the Enhance API. Returns True on success."""
+    resp = api_client.post_with_response(f"/v2/websites/{website_id}/restart_php", {}, logger)
+    if resp is None:
+        return False
+    if resp.status_code == 200:
+        return True
+    logger.error(
+        f"[{website_id}] API restart_php returned {resp.status_code}: {resp.text[:200]}"
+    )
+    return False
 
+
+# ---------------------------------------------------------------------------
+# Site probe
+# ---------------------------------------------------------------------------
 
 def _probe_site(domain):
     """
@@ -366,20 +338,3 @@ def _probe_site(domain):
         return resp.status_code
     except requests.RequestException:
         return None
-
-
-def _restart_php(website_id, config, logger):
-    """Trigger a PHP restart for the website via the Enhance API. Returns True on success."""
-    url     = f"{config.get('enhance_url', '').rstrip('/')}/v2/websites/{website_id}/restart_php"
-    headers = {"Authorization": f"Bearer {config.get('enhance_token', '')}"}
-    try:
-        resp = requests.post(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            return True
-        logger.error(
-            f"[{website_id}] API restart_php returned {resp.status_code}: {resp.text[:200]}"
-        )
-        return False
-    except requests.RequestException as e:
-        logger.error(f"[{website_id}] API restart_php request failed: {e}")
-        return False

@@ -7,7 +7,6 @@ Triggered by inotify on /var/www/{uuid}/.htaccess (webspace root file).
 Called by webservertune-enhance main program.
 """
 
-import json
 import os
 import pwd
 import re
@@ -15,8 +14,6 @@ import shutil
 import subprocess
 import threading
 import time
-import urllib.request
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -89,23 +86,17 @@ def cleanup(config, logger):
 # watch — entry point when ols_redirects = true
 # ---------------------------------------------------------------------------
 
-def watch(config, logger):
+def watch(config, logger, api_client):
     """Entry point called by main program when ols_redirects is enabled."""
     logger.info("olsredirects starting")
 
-    api           = config.get("api", {})
-    api_url       = api.get("enhance_url", "").rstrip("/")
-    master_org    = api.get("enhance_org_id", "")
-    api_token     = api.get("enhance_token", "")
-    general       = config.get("general", {})
-    debounce_secs = general.get("debounce_seconds", 10)
-
-    if not all([api_url, master_org, api_token]):
+    if not api_client.is_configured():
         logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
         return
 
-    org_cache       = {}
-    org_cache_lock  = threading.Lock()
+    general       = config.get("general", {})
+    debounce_secs = general.get("debounce_seconds", 10)
+
     known_uuids     = set()
     uuid_lock       = threading.Lock()
     watcher_proc    = [None]
@@ -124,70 +115,6 @@ def watch(config, logger):
             return pwd.getpwuid(stat.st_uid)
         except Exception:
             return None
-
-
-    # ---------------------------------------------------------------------------
-    # API
-    # ---------------------------------------------------------------------------
-
-    def _api_get(path):
-        """Perform a GET request against the Enhance API and return parsed JSON, or None on error."""
-        url = f"{api_url}{path}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for {url}")
-            return None
-        except Exception as e:
-            logger.error(f"Request failed for {url}: {e}")
-            return None
-
-    def _build_org_cache():
-        """
-        Fetch all websites under the master org recursively and build a
-        {website_id: org_id} mapping. Paginates until all websites are retrieved.
-        Retries up to 5 times with a 60s delay to handle control panel startup lag.
-        """
-        for attempt in range(1, 6):
-            websites = {}
-            offset   = 0
-            limit    = 100
-            failed   = False
-
-            while True:
-                data = _api_get(
-                    f"/orgs/{master_org}/websites"
-                    f"?recursion=infinite&offset={offset}&limit={limit}"
-                )
-                if data is None:
-                    failed = True
-                    break
-                for site in data.get("items", []):
-                    websites[site["id"]] = site["orgId"]
-                total = data.get("total", 0)
-                offset += limit
-                if offset >= total:
-                    break
-
-            if not failed:
-                with org_cache_lock:
-                    org_cache.clear()
-                    org_cache.update(websites)
-                logger.info(f"Org cache built: {len(org_cache)} website(s)")
-                return
-
-            if attempt < 5:
-                logger.warning(f"Org cache build failed (attempt {attempt}/5), retrying in 60s")
-                time.sleep(60)
-
-        logger.error("Org cache build failed after 5 attempts, startup sync will be skipped")
-
-    def _get_org_id(uuid):
-        """Return the org ID for a website UUID from the cache, or None if not found."""
-        with org_cache_lock:
-            return org_cache.get(uuid)
 
 
     # ---------------------------------------------------------------------------
@@ -337,16 +264,16 @@ def watch(config, logger):
         document root .htaccess files. Domains sharing a document root have
         their rules merged into a single managed block.
         """
-        org_id = _get_org_id(uuid)
+        org_id = api_client.get_org_id(uuid, logger)
         if not org_id:
             logger.debug(f"[{uuid}] Org not found in cache, skipping sync")
             return
 
-        domains_data = _api_get(f"/orgs/{org_id}/websites/{uuid}/domains")
+        domains_data = api_client.get(f"/orgs/{org_id}/websites/{uuid}/domains", logger)
         if domains_data is None:
             return
 
-        htaccess_data = _api_get(f"/orgs/{org_id}/websites/{uuid}/htaccess")
+        htaccess_data = api_client.get(f"/orgs/{org_id}/websites/{uuid}/htaccess", logger)
         if htaccess_data is None:
             return
 
@@ -538,11 +465,9 @@ def watch(config, logger):
 
     def _startup():
         """
-        Build org cache, register all current UUID directories, and sync
-        redirect rules for all sites in parallel.
+        Register all current UUID directories and sync redirect rules for all
+        sites in parallel.
         """
-        _build_org_cache()
-
         try:
             for entry in os.listdir(WWW_DIR):
                 if UUID_RE.fullmatch(entry):

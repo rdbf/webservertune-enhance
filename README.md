@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.5.2  
+**Version:** 0.6.0  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -21,6 +21,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Automatic timestamped backups before any change, with rollback on failure
 - Persistent logging: Per-site webserver access logs written to `/var/www/<UUID>/logs/webserver.log`, for both Nginx and OLS
 - PHP log persistence: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
+- Cloudflare API health: Monitors all CF-managed domains cluster-wide for zones stuck in `Error` state and automatically re-applies the existing token via the Enhance API. Checks all websites across all servers in the cluster — only needs to run on one server.
 
 ### Nginx
 - HTTP/3: QUIC listeners, Alt-Svc headers, and FastCGI HTTP_HOST in website vhosts
@@ -93,6 +94,7 @@ tail -f /var/log/webservertune-enhance/olstune.log
 tail -f /var/log/webservertune-enhance/ols503fix.log
 tail -f /var/log/webservertune-enhance/olsredirects.log
 tail -f /var/log/webservertune-enhance/olslsapi.log
+tail -f /var/log/webservertune-enhance/cfapihealth.log
 ```
 
 ## Configuration
@@ -106,6 +108,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `enhance_url` | — | Enhance panel API URL |
 | `enhance_org_id` | — | Enhance organisation UUID |
 | `enhance_token` | — | Enhance API bearer token |
+| `org_cache_ttl` | `3600` | Seconds between automatic org cache refreshes |
 
 ### General
 
@@ -168,6 +171,13 @@ Enforced key/value pairs in `httpd_config.conf`. Supports top-level keys under `
 | `children_below_nproc` | `3` | lsapiChildren is set to nproc minus this value |
 | `interval_seconds` | `21600` | How often to re-check and update all sites |
 
+### Cloudflare API Health
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Load and start the cfapihealth module. Checks all websites across the cluster — only needs to be enabled on one server |
+| `poll_interval_seconds` | `1800` | How often to check CF domain status |
+
 ## Backup System
 
 - **Location**: `/opt/webservertune-enhance/backups/`
@@ -220,6 +230,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.6.0** — Cloudflare API health monitoring. Shared internal API client. Config format changed.
 
 **0.5.2** — Set LSAPI_CHILDREN per site based on NPROC cgroup limit. Config format changed.
 

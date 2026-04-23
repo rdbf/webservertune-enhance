@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+enhanceapi
+Shared Enhance API client for webservertune-enhance modules.
+Centralises HTTP communication, org cache, and domain cache.
+Instantiated once in the main program and passed to each module.
+"""
+
+import json
+import threading
+import time
+import urllib.request
+import urllib.error
+
+try:
+    import requests as _requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
+
+
+class EnhanceAPI:
+
+    def __init__(self, config, logger):
+        api = config.get("api", {})
+        self._api_url = api.get("enhance_url", "").rstrip("/")
+        self._org_id  = api.get("enhance_org_id", "")
+        self._token   = api.get("enhance_token", "")
+        self._ttl     = api.get("org_cache_ttl", 3600)
+        self._logger  = logger
+
+        self._org_cache       = {}
+        self._org_cache_lock  = threading.Lock()
+        self._build_lock      = threading.Lock()
+        self._last_build_time = 0.0
+
+        # domain cache: {website_id: (domain, timestamp)}
+        self._domain_cache      = {}
+        self._domain_cache_lock = threading.Lock()
+
+        t = threading.Thread(target=self._refresh_loop, daemon=True)
+        t.start()
+
+    # -------------------------------------------------------------------------
+    # Internal
+    # -------------------------------------------------------------------------
+
+    def _headers(self):
+        return {"Authorization": f"Bearer {self._token}"}
+
+    def _refresh_loop(self):
+        """Periodically rebuild the org cache on the configured TTL interval."""
+        while True:
+            time.sleep(self._ttl)
+            self.build_org_cache(self._logger)
+
+    def is_configured(self):
+        """Return True if all required API credentials are present."""
+        return all([self._api_url, self._org_id, self._token])
+
+    # -------------------------------------------------------------------------
+    # HTTP methods
+    # -------------------------------------------------------------------------
+
+    def get(self, path, logger):
+        """GET request against the Enhance API. Returns parsed JSON or None on error."""
+        url = f"{self._api_url}{path}"
+        req = urllib.request.Request(url, headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP {e.code} for GET {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Request failed for GET {url}: {e}")
+            return None
+
+    def put(self, path, body, logger):
+        """PUT request against the Enhance API. Returns True on HTTP 200."""
+        url  = f"{self._api_url}{path}"
+        data = json.dumps(body).encode()
+        req  = urllib.request.Request(
+            url, data=data,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            method="PUT"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status == 200
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP {e.code} for PUT {url}")
+            return False
+        except Exception as e:
+            logger.error(f"Request failed for PUT {url}: {e}")
+            return False
+
+    def delete(self, path, logger):
+        """DELETE request against the Enhance API. Returns True on HTTP 200 or 204."""
+        url = f"{self._api_url}{path}"
+        req = urllib.request.Request(url, headers=self._headers(), method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status in (200, 204)
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP {e.code} for DELETE {url}")
+            return False
+        except Exception as e:
+            logger.error(f"Request failed for DELETE {url}: {e}")
+            return False
+
+    def get_with_response(self, path, logger):
+        """GET request using requests library. Returns response object or None on error."""
+        if not _HAS_REQUESTS:
+            logger.error("requests library not available")
+            return None
+        url = f"{self._api_url}{path}"
+        try:
+            return _requests.get(url, headers=self._headers(), timeout=10)
+        except _requests.RequestException as e:
+            logger.warning(f"GET {url} failed: {e}")
+            return None
+
+    def post_with_response(self, path, body, logger):
+        """POST request using requests library. Returns response object or None on error."""
+        if not _HAS_REQUESTS:
+            logger.error("requests library not available")
+            return None
+        url = f"{self._api_url}{path}"
+        try:
+            return _requests.post(url, headers=self._headers(), json=body, timeout=10)
+        except _requests.RequestException as e:
+            logger.error(f"POST {url} failed: {e}")
+            return None
+
+    # -------------------------------------------------------------------------
+    # Org cache
+    # -------------------------------------------------------------------------
+
+    def build_org_cache(self, logger):
+        """
+        Full paginated rebuild of the {website_id: org_id} cache.
+        Up to 5 attempts with 60s delay between retries.
+        If a build is already in progress, waits for it to complete then returns
+        without making any API calls — the cache will have been refreshed.
+        Records build time on every successful build.
+        """
+        acquired = self._build_lock.acquire(blocking=False)
+        if not acquired:
+            logger.debug("Org cache build already in progress, waiting")
+            self._build_lock.acquire()
+            self._build_lock.release()
+            return
+
+        try:
+            for attempt in range(1, 6):
+                websites = {}
+                offset   = 0
+                limit    = 100
+                failed   = False
+
+                while True:
+                    data = self.get(
+                        f"/orgs/{self._org_id}/websites"
+                        f"?recursion=infinite&offset={offset}&limit={limit}",
+                        logger
+                    )
+                    if data is None:
+                        failed = True
+                        break
+                    for site in data.get("items", []):
+                        websites[site["id"]] = site["orgId"]
+                    total = data.get("total", 0)
+                    offset += limit
+                    if offset >= total:
+                        break
+
+                if not failed:
+                    with self._org_cache_lock:
+                        self._org_cache.clear()
+                        self._org_cache.update(websites)
+                        self._last_build_time = time.time()
+                    logger.info(f"Org cache built: {len(websites)} website(s)")
+                    return
+
+                if attempt < 5:
+                    logger.warning(
+                        f"Org cache build failed (attempt {attempt}/5), retrying in 60s"
+                    )
+                    time.sleep(60)
+
+            logger.error("Org cache build failed after 5 attempts")
+
+        finally:
+            self._build_lock.release()
+
+    def get_org_id(self, uuid, logger):
+        """
+        Return the org ID for a website UUID.
+        On a cache miss, triggers a rebuild only if the cache is more than 60 seconds
+        old — rapid misses at startup (e.g. non-Enhance UUIDs) are returned as None
+        without triggering redundant rebuilds.
+        Returns None if the UUID is not found after rebuild.
+        """
+        with self._org_cache_lock:
+            org_id = self._org_cache.get(uuid)
+        if org_id is not None:
+            return org_id
+
+        with self._org_cache_lock:
+            cache_age = time.time() - self._last_build_time
+
+        if cache_age < 60:
+            logger.debug(f"[{uuid}] Org cache miss, cache is fresh ({cache_age:.0f}s old), skipping rebuild")
+            return None
+
+        logger.debug(f"[{uuid}] Org cache miss, triggering rebuild")
+        self.build_org_cache(logger)
+
+        with self._org_cache_lock:
+            return self._org_cache.get(uuid)
+
+    # -------------------------------------------------------------------------
+    # Domain cache
+    # -------------------------------------------------------------------------
+
+    def get_primary_domain(self, website_id, logger):
+        """
+        Return the primary domain for a website, using a 300s per-site cache.
+        Uses the master org ID, matching the original ols503fix behaviour.
+        Returns None if no primary domain is found or on API error.
+        """
+        now = time.time()
+
+        with self._domain_cache_lock:
+            entry = self._domain_cache.get(website_id)
+
+        if entry is not None:
+            domain, ts = entry
+            if now - ts < 300:
+                logger.debug(f"[{website_id}] Using cached domain: {domain}")
+                return domain
+
+        if not self._org_id:
+            logger.warning(f"[{website_id}] enhance_org_id not set — skipping domain lookup")
+            return None
+
+        resp = self.get_with_response(
+            f"/orgs/{self._org_id}/websites/{website_id}/domains", logger
+        )
+        if resp is None:
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                f"[{website_id}] Domain lookup returned {resp.status_code} — skipping probe"
+            )
+            return None
+
+        items = resp.json().get("items", [])
+        for item in items:
+            if item.get("mappingKind") == "primary":
+                domain = item.get("domain")
+                with self._domain_cache_lock:
+                    self._domain_cache[website_id] = (domain, now)
+                logger.debug(f"[{website_id}] Primary domain found: {domain}")
+                return domain
+
+        logger.warning(f"[{website_id}] No primary domain found — skipping probe")
+        return None

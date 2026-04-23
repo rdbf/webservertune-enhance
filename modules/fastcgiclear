@@ -7,7 +7,6 @@ and clears FastCGI cache via the Enhance API for all domains in the webspace.
 Called by webservertune-enhance main program.
 """
 
-import json
 import os
 import pwd
 import re
@@ -15,8 +14,6 @@ import shutil
 import subprocess
 import threading
 import time
-import urllib.request
-import urllib.error
 from pathlib import Path
 
 WWW_DIR        = Path("/var/www")
@@ -34,21 +31,16 @@ UUID_RE = re.compile(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def watch(config, logger):
+def watch(config, logger, api_client):
     """Entry point called by main program."""
     logger.info("fastcgiclear starting")
 
-    general       = config.get("general", {})
-    api           = config.get("api", {})
-    debounce_secs = general.get("debounce_seconds", 10)
-
-    api_url   = api.get("enhance_url", "").rstrip("/")
-    org_id    = api.get("enhance_org_id", "")
-    api_token = api.get("enhance_token", "")
-
-    if not all([api_url, org_id, api_token]):
+    if not api_client.is_configured():
         logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
         return
+
+    general       = config.get("general", {})
+    debounce_secs = general.get("debounce_seconds", 10)
 
     known_uuids     = set()
     uuid_lock       = threading.Lock()
@@ -148,27 +140,19 @@ def watch(config, logger):
     # API
     # ---------------------------------------------------------------------------
 
-    def _api_get(path):
-        """Perform a GET request against the Enhance API and return parsed JSON, or None on error."""
-        url = f"{api_url}{path}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for {url}")
-            return None
-        except Exception as e:
-            logger.error(f"Request failed for {url}: {e}")
-            return None
-
     def _do_clear(uuid):
         """
         Clear FastCGI cache for all domains in the webspace via the Enhance API,
         then reset the flag file to cache=cleared.
         """
         logger.info(f"[{uuid}] Clearing FastCGI cache")
-        data = _api_get(f"/orgs/{org_id}/websites/{uuid}/domains")
+
+        org_id = api_client.get_org_id(uuid, logger)
+        if not org_id:
+            logger.debug(f"[{uuid}] Org not found, skipping cache clear")
+            return
+
+        data = api_client.get(f"/orgs/{org_id}/websites/{uuid}/domains", logger)
         if data is None:
             return
 
@@ -177,19 +161,11 @@ def watch(config, logger):
             domain_name = item.get("domain", domain_id)
             if not domain_id:
                 continue
-            url = f"{api_url}/v2/domains/{domain_id}/nginx_fastcgi"
-            req = urllib.request.Request(
-                url,
-                headers={"Authorization": f"Bearer {api_token}"},
-                method="DELETE"
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    logger.info(f"[{uuid}] Cleared cache for {domain_name} ({resp.status})")
-            except urllib.error.HTTPError as e:
-                logger.error(f"[{uuid}] Failed to clear {domain_name}: HTTP {e.code}")
-            except Exception as e:
-                logger.error(f"[{uuid}] Failed to clear {domain_name}: {e}")
+            ok = api_client.delete(f"/v2/domains/{domain_id}/nginx_fastcgi", logger)
+            if ok:
+                logger.info(f"[{uuid}] Cleared cache for {domain_name}")
+            else:
+                logger.error(f"[{uuid}] Failed to clear cache for {domain_name}")
 
         flag = WWW_DIR / uuid / FLAG_FILE
         pw   = _get_webspace_pw(uuid)

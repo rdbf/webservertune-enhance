@@ -4,6 +4,7 @@
 enhance_url      = "https://example.com/api"
 enhance_org_id   = ""
 enhance_token    = ""
+org_cache_ttl    = 3600
 
 [general]
 log_level             = "INFO"
@@ -69,3 +70,7 @@ scan_interval    = 1
 enabled              = false
 children_below_nproc = 3
 interval_seconds     = 21600
+
+[cf-api-health]
+enabled               = false
+poll_interval_seconds = 1800

@@ -121,6 +121,13 @@ def main():
 
     logger.info(f"Detected webserver: {webserver}")
 
+    # shared API client — instantiated once, passed to all modules that need it
+    enhanceapi = load_module("enhanceapi")
+    api_logger = setup_logger("enhanceapi", log_level)
+    api_client = enhanceapi.EnhanceAPI(config, api_logger)
+    # initial build before any module thread starts so get_org_id() hits a warm cache
+    api_client.build_org_cache(api_logger)
+
     if webserver == "nginx":
         nginxtune    = load_module("nginxtune")
         nginx_logger = setup_logger("nginxtune", log_level)
@@ -138,7 +145,7 @@ def main():
             fcc_logger   = setup_logger("fastcgiclear", log_level)
             t_fcc        = threading.Thread(
                 target=fastcgiclear.watch,
-                args=(config, fcc_logger),
+                args=(config, fcc_logger, api_client),
                 daemon=True
             )
             t_fcc.start()
@@ -148,7 +155,7 @@ def main():
             redir_logger   = setup_logger("nginxredirects", log_level)
             t_redir        = threading.Thread(
                 target=nginxredirects.watch,
-                args=(config, redir_logger),
+                args=(config, redir_logger, api_client),
                 daemon=True
             )
             t_redir.start()
@@ -174,7 +181,7 @@ def main():
             fix_logger = setup_logger("ols503fix", log_level)
             t2 = threading.Thread(
                 target=ols503fix.run,
-                args=(config, fix_logger, site_watcher),
+                args=(config, fix_logger, site_watcher, api_client),
                 daemon=True
             )
             t2.start()
@@ -184,7 +191,7 @@ def main():
             lsapi_logger = setup_logger("olslsapi", log_level)
             t_lsapi      = threading.Thread(
                 target=olslsapi.run,
-                args=(config, lsapi_logger, site_watcher),
+                args=(config, lsapi_logger, site_watcher, api_client),
                 daemon=True
             )
             t_lsapi.start()
@@ -196,10 +203,21 @@ def main():
         if config.get("general", {}).get("ols_redirects", False):
             t3 = threading.Thread(
                 target=olsredirects.watch,
-                args=(config, ols_redir_logger),
+                args=(config, ols_redir_logger, api_client),
                 daemon=True
             )
             t3.start()
+
+    # independent of webserver — runs on both nginx and ols
+    if config.get("cf-api-health", {}).get("enabled", False):
+        cfapihealth = load_module("cfapihealth")
+        cfa_logger  = setup_logger("cfapihealth", log_level)
+        t_cfa       = threading.Thread(
+            target=cfapihealth.run,
+            args=(config, cfa_logger, api_client),
+            daemon=True
+        )
+        t_cfa.start()
 
     def watch_config():
         """Watch for settings.conf changes and exit so systemd restarts the service."""

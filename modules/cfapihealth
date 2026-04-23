@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+cfapihealth
+Monitors Cloudflare DNS zones for domains in "Error" state and re-applies
+the existing CF token via the Enhance API to remediate the issue.
+Runs independently of the active webserver.
+Called by webservertune-enhance main program.
+"""
+
+import threading
+import time
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def run(config, logger, api_client):
+    """Entry point called by main program."""
+    logger.info("cfapihealth starting")
+
+    if not api_client.is_configured():
+        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
+        return
+
+    cfg           = config.get("cf-api-health", {})
+    poll_interval = cfg.get("poll_interval_seconds", 1800)
+    org_id        = config.get("api", {}).get("enhance_org_id", "")
+
+    # registry: list of {website_id, org_id, domain_id, domain_name, cloudflare_token_id}
+    registry      = []
+    registry_lock = threading.Lock()
+
+
+    # ---------------------------------------------------------------------------
+    # Tier 2 — health check
+    # ---------------------------------------------------------------------------
+
+    def _health_check():
+        """
+        Check CF status for all registered domains.
+        Re-applies the existing token for any domain in Error state.
+        Runs immediately after each discovery pass, then every poll_interval_seconds.
+        """
+        with registry_lock:
+            snapshot = list(registry)
+
+        if not snapshot:
+            logger.debug("No CF-managed domains in registry, skipping health check")
+            return
+
+        # group by website_id to minimise API calls — one domains call per website
+        by_website = {}
+        for entry in snapshot:
+            wid = entry["website_id"]
+            if wid not in by_website:
+                by_website[wid] = []
+            by_website[wid].append(entry)
+
+        for website_id, entries in by_website.items():
+            site_org_id = entries[0]["org_id"]
+
+            data = api_client.get(
+                f"/orgs/{site_org_id}/websites/{website_id}/domains", logger
+            )
+            if data is None:
+                continue
+
+            domain_map = {item.get("domainId"): item for item in data.get("items", [])}
+
+            for entry in entries:
+                domain_id   = entry["domain_id"]
+                domain_name = entry["domain_name"]
+                token_id    = entry["cloudflare_token_id"]
+
+                item = domain_map.get(domain_id)
+                if item is None:
+                    logger.debug(f"[{domain_name}] Not found in current domain mapping, skipping")
+                    continue
+
+                status = item.get("cloudflareStatus")
+                logger.debug(f"[{domain_name}] CF status: {status}")
+
+                if status == "Error":
+                    logger.info(
+                        f"[{domain_name}] CF status Error detected, "
+                        f"re-applying token ({website_id})"
+                    )
+                    ok = api_client.put(
+                        f"/orgs/{site_org_id}/domains/{domain_id}/cloudflare",
+                        token_id,
+                        logger
+                    )
+                    if ok:
+                        logger.info(f"[{domain_name}] CF token re-applied ({website_id})")
+                    else:
+                        logger.error(
+                            f"[{domain_name}] Failed to re-apply CF token ({website_id})"
+                        )
+                elif status == "Disconnected":
+                    logger.debug(
+                        f"[{domain_name}] CF status Disconnected — deliberate state, no action"
+                    )
+
+
+    # ---------------------------------------------------------------------------
+    # Tier 1 — discovery
+    # ---------------------------------------------------------------------------
+
+    def _discover():
+        """
+        Paginate all websites and collect CF-managed domain mappings into the registry.
+        Up to 5 attempts with 60s delay between retries on website listing failure.
+        Triggers a Tier 2 health check immediately after completion.
+        """
+        logger.info("cfapihealth: starting discovery")
+
+        websites = {}
+        for attempt in range(1, 6):
+            websites = {}
+            offset   = 0
+            limit    = 100
+            failed   = False
+
+            while True:
+                data = api_client.get(
+                    f"/orgs/{org_id}/websites"
+                    f"?recursion=infinite&offset={offset}&limit={limit}",
+                    logger
+                )
+                if data is None:
+                    failed = True
+                    break
+                for site in data.get("items", []):
+                    websites[site["id"]] = site["orgId"]
+                total = data.get("total", 0)
+                offset += limit
+                if offset >= total:
+                    break
+
+            if not failed:
+                break
+
+            if attempt < 5:
+                logger.warning(
+                    f"Discovery website listing failed (attempt {attempt}/5), retrying in 60s"
+                )
+                time.sleep(60)
+        else:
+            logger.error("Discovery failed after 5 attempts, skipping")
+            return
+
+        new_registry = []
+        for website_id, site_org_id in websites.items():
+            data = api_client.get(
+                f"/orgs/{site_org_id}/websites/{website_id}/domains", logger
+            )
+            if data is None:
+                continue
+            for item in data.get("items", []):
+                token_id = item.get("cloudflareTokenId")
+                if not token_id:
+                    continue
+                new_registry.append({
+                    "website_id":          website_id,
+                    "org_id":              site_org_id,
+                    "domain_id":           item.get("domainId"),
+                    "domain_name":         item.get("domain"),
+                    "cloudflare_token_id": token_id,
+                })
+
+        with registry_lock:
+            registry.clear()
+            registry.extend(new_registry)
+
+        logger.info(
+            f"cfapihealth: discovery complete — {len(new_registry)} CF-managed domain(s) "
+            f"across {len(websites)} website(s)"
+        )
+
+        _health_check()
+
+
+    # ---------------------------------------------------------------------------
+    # Loops
+    # ---------------------------------------------------------------------------
+
+    def _discovery_loop():
+        """Run discovery at startup, then every 86400 seconds."""
+        _discover()
+        while True:
+            time.sleep(86400)
+            _discover()
+
+    def _health_loop():
+        """Run health check every poll_interval_seconds, independent of discovery."""
+        while True:
+            time.sleep(poll_interval)
+            _health_check()
+
+    threading.Thread(target=_discovery_loop, daemon=True).start()
+    threading.Thread(target=_health_loop, daemon=True).start()
+
+    while True:
+        time.sleep(60)

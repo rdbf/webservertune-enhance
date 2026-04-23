@@ -6,11 +6,8 @@ cgroup limits. Runs at startup and polls periodically for changes.
 Called by webservertune-enhance main program.
 """
 
-import json
 import threading
 import time
-import urllib.request
-import urllib.error
 
 DEFAULT_CHILDREN = 100
 
@@ -19,115 +16,20 @@ DEFAULT_CHILDREN = 100
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run(config, logger, site_watcher):
+def run(config, logger, site_watcher, api_client):
     """Entry point called by main program."""
     logger.info("olslsapi starting")
 
-    api              = config.get("api", {})
-    api_url          = api.get("enhance_url", "").rstrip("/")
-    master_org       = api.get("enhance_org_id", "")
-    api_token        = api.get("enhance_token", "")
+    if not api_client.is_configured():
+        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
+        return
+
     cfg              = config.get("ols-lsapi", {})
     offset           = cfg.get("children_below_nproc", 3)
     interval_seconds = cfg.get("interval_seconds", 21600)
 
-    if not all([api_url, master_org, api_token]):
-        logger.error("enhance_url, enhance_org_id, enhance_token must be set in [api]")
-        return
-
-    org_cache      = {}
-    org_cache_lock = threading.Lock()
     registry       = {}
     registry_lock  = threading.Lock()
-
-
-    # ---------------------------------------------------------------------------
-    # API helpers
-    # ---------------------------------------------------------------------------
-
-    def _api_get(path):
-        """Perform a GET request against the Enhance API and return parsed JSON, or None on error."""
-        url = f"{api_url}{path}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for {url}")
-            return None
-        except Exception as e:
-            logger.error(f"Request failed for {url}: {e}")
-            return None
-
-    def _api_put(path, body):
-        """Perform a PUT request against the Enhance API. Returns True on success."""
-        url  = f"{api_url}{path}"
-        data = json.dumps(body).encode()
-        req  = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
-            method="PUT"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status == 200
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for PUT {url}")
-            return False
-        except Exception as e:
-            logger.error(f"Request failed for PUT {url}: {e}")
-            return False
-
-
-    # ---------------------------------------------------------------------------
-    # Org cache
-    # ---------------------------------------------------------------------------
-
-    def _build_org_cache():
-        """
-        Fetch all websites under the master org recursively and build a
-        {website_id: org_id} mapping. Paginates until all websites are retrieved.
-        Retries up to 5 times with a 60s delay to handle control panel startup lag.
-        """
-        for attempt in range(1, 6):
-            websites = {}
-            page_offset = 0
-            limit       = 100
-            failed      = False
-
-            while True:
-                data = _api_get(
-                    f"/orgs/{master_org}/websites"
-                    f"?recursion=infinite&offset={page_offset}&limit={limit}"
-                )
-                if data is None:
-                    failed = True
-                    break
-                for site in data.get("items", []):
-                    websites[site["id"]] = site["orgId"]
-                total = data.get("total", 0)
-                page_offset += limit
-                if page_offset >= total:
-                    break
-
-            if not failed:
-                with org_cache_lock:
-                    org_cache.clear()
-                    org_cache.update(websites)
-                logger.info(f"Org cache built: {len(org_cache)} website(s)")
-                return
-
-            if attempt < 5:
-                logger.warning(f"Org cache build failed (attempt {attempt}/5), retrying in 60s")
-                time.sleep(60)
-
-        logger.error("Org cache build failed after 5 attempts")
-
-    def _get_org_id(uuid):
-        """Return the org ID for a website UUID from the cache, or None if not found."""
-        with org_cache_lock:
-            return org_cache.get(uuid)
 
 
     # ---------------------------------------------------------------------------
@@ -139,12 +41,12 @@ def run(config, logger, site_watcher):
         Fetch nproc and current lsapiChildren for a site, calculate the target
         value, and PUT if it differs.
         """
-        org_id = _get_org_id(uuid)
+        org_id = api_client.get_org_id(uuid, logger)
         if not org_id:
             logger.debug(f"[{uuid}] Org not found in cache, skipping")
             return
 
-        cgroup = _api_get(f"/orgs/{org_id}/websites/{uuid}/cgroup_limits")
+        cgroup = api_client.get(f"/orgs/{org_id}/websites/{uuid}/cgroup_limits", logger)
         if cgroup is None:
             return
 
@@ -157,7 +59,7 @@ def run(config, logger, site_watcher):
             target = max(1, int(nproc) - offset)
             logger.debug(f"[{uuid}] nproc={nproc}, target lsapiChildren={target}")
 
-        current_data = _api_get(f"/websites/{uuid}/lsphp_settings")
+        current_data = api_client.get(f"/websites/{uuid}/lsphp_settings", logger)
         if current_data is None:
             return
 
@@ -166,7 +68,7 @@ def run(config, logger, site_watcher):
             logger.debug(f"[{uuid}] lsapiChildren already {target}, no change needed")
             return
 
-        success = _api_put(f"/websites/{uuid}/lsphp_settings", {"lsapiChildren": target})
+        success = api_client.put(f"/websites/{uuid}/lsphp_settings", {"lsapiChildren": target}, logger)
         if success:
             logger.info(f"[{uuid}] lsapiChildren set to {target} (was {current})")
         else:
@@ -206,6 +108,4 @@ def run(config, logger, site_watcher):
 
     threading.Thread(target=_poll_loop, daemon=True).start()
 
-    # build org cache before registering consumer so on_add fires with a populated cache
-    _build_org_cache()
     site_watcher.register_consumer(on_add, on_remove)

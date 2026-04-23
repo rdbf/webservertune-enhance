@@ -105,6 +105,41 @@ def watch(config, logger, api_client):
 
 
     # ---------------------------------------------------------------------------
+    # OLS readiness check
+    # ---------------------------------------------------------------------------
+
+    def _wait_for_ols():
+        """
+        Poll systemctl is-active lshttpd up to 10 times with debounce_secs between
+        each check. If OLS does not reach active state within the attempts, perform
+        a clean recovery: stop lshttpd, kill all openlitespeed processes, start lshttpd.
+        """
+        for attempt in range(1, 11):
+            result = subprocess.run(
+                ["systemctl", "is-active", "lshttpd"],
+                capture_output=True, text=True
+            )
+            state = result.stdout.strip()
+            if state == "active":
+                logger.debug(f"OLS active after {attempt} check(s)")
+                return
+            logger.debug(f"OLS state check {attempt}/10: {state}")
+            time.sleep(debounce_secs)
+
+        logger.warning(
+            "OLS did not reach active state after 10 checks — "
+            "stopping, killing all processes, and starting clean"
+        )
+        try:
+            subprocess.run(["systemctl", "stop", "lshttpd"], capture_output=True)
+            subprocess.run(["killall", "openlitespeed"], capture_output=True)
+            subprocess.run(["systemctl", "start", "lshttpd"], capture_output=True)
+            logger.info("OLS clean start issued")
+        except Exception as e:
+            logger.error(f"OLS clean start failed: {e}")
+
+
+    # ---------------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------------
 
@@ -465,9 +500,11 @@ def watch(config, logger, api_client):
 
     def _startup():
         """
-        Register all current UUID directories and sync redirect rules for all
-        sites in parallel.
+        Wait for OLS to be active, then register all current UUID directories
+        and sync redirect rules for all sites in parallel.
         """
+        _wait_for_ols()
+
         try:
             for entry in os.listdir(WWW_DIR):
                 if UUID_RE.fullmatch(entry):

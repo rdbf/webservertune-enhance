@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.6.0  
+**Version:** 0.6.1  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -45,7 +45,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Root access
 - Enhance hosting environment
 - Python 3.11+ (default on Ubuntu 24.04)
-- inotify-tools: `apt install inotify-tools`
+- Dependencies: `apt install inotify-tools python3-httpx python3-h2`
 - Enhance installed updated Nginx (1.28.0) or OpenLiteSpeed (1.8.5)
 
 ## Installation
@@ -230,6 +230,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.6.1** — Fix HTTP/1.1 issue of communication with API from controlpanel server. Switch to httpx + h2 libraries for HTTP/2 to API.
 
 **0.6.0** — Cloudflare API health monitoring. Shared internal API client. Config format changed.
 

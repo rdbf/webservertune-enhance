@@ -231,7 +231,7 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Version History
 
-**0.6.1** — Fix HTTP/1.1 issue of communication with API from controlpanel server. Switch to httpx + h2 libraries for HTTP/2 to API.
+**0.6.1** — Fix HTTP/1.1 issue of communication with API from controlpanel server. Switch to httpx + h2 libraries for HTTP/2 to API. New dependencies must be installed before updating to this version.
 
 **0.6.0** — Cloudflare API health monitoring. Shared internal API client. Config format changed.
 

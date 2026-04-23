@@ -6,17 +6,10 @@ Centralises HTTP communication, org cache, and domain cache.
 Instantiated once in the main program and passed to each module.
 """
 
-import json
 import threading
 import time
-import urllib.request
-import urllib.error
 
-try:
-    import requests as _requests
-    _HAS_REQUESTS = True
-except ImportError:
-    _HAS_REQUESTS = False
+import httpx
 
 
 class EnhanceAPI:
@@ -65,32 +58,27 @@ class EnhanceAPI:
     def get(self, path, logger):
         """GET request against the Enhance API. Returns parsed JSON or None on error."""
         url = f"{self._api_url}{path}"
-        req = urllib.request.Request(url, headers=self._headers())
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for GET {url}")
-            return None
+            with httpx.Client(http2=True, timeout=15) as client:
+                resp = client.get(url, headers=self._headers())
+            if resp.status_code != 200:
+                logger.error(f"HTTP {resp.status_code} for GET {url}")
+                return None
+            return resp.json()
         except Exception as e:
             logger.error(f"Request failed for GET {url}: {e}")
             return None
 
     def put(self, path, body, logger):
         """PUT request against the Enhance API. Returns True on HTTP 200."""
-        url  = f"{self._api_url}{path}"
-        data = json.dumps(body).encode()
-        req  = urllib.request.Request(
-            url, data=data,
-            headers={**self._headers(), "Content-Type": "application/json"},
-            method="PUT"
-        )
+        url = f"{self._api_url}{path}"
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status == 200
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for PUT {url}")
-            return False
+            with httpx.Client(http2=True, timeout=15) as client:
+                resp = client.put(url, headers=self._headers(), json=body)
+            if resp.status_code != 200:
+                logger.error(f"HTTP {resp.status_code} for PUT {url}")
+                return False
+            return True
         except Exception as e:
             logger.error(f"Request failed for PUT {url}: {e}")
             return False
@@ -98,38 +86,34 @@ class EnhanceAPI:
     def delete(self, path, logger):
         """DELETE request against the Enhance API. Returns True on HTTP 200 or 204."""
         url = f"{self._api_url}{path}"
-        req = urllib.request.Request(url, headers=self._headers(), method="DELETE")
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status in (200, 204)
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code} for DELETE {url}")
-            return False
+            with httpx.Client(http2=True, timeout=15) as client:
+                resp = client.delete(url, headers=self._headers())
+            if resp.status_code not in (200, 204):
+                logger.error(f"HTTP {resp.status_code} for DELETE {url}")
+                return False
+            return True
         except Exception as e:
             logger.error(f"Request failed for DELETE {url}: {e}")
             return False
 
     def get_with_response(self, path, logger):
-        """GET request using requests library. Returns response object or None on error."""
-        if not _HAS_REQUESTS:
-            logger.error("requests library not available")
-            return None
+        """GET request against the Enhance API. Returns response object or None on error."""
         url = f"{self._api_url}{path}"
         try:
-            return _requests.get(url, headers=self._headers(), timeout=10)
-        except _requests.RequestException as e:
+            with httpx.Client(http2=True, timeout=15) as client:
+                return client.get(url, headers=self._headers())
+        except Exception as e:
             logger.warning(f"GET {url} failed: {e}")
             return None
 
     def post_with_response(self, path, body, logger):
-        """POST request using requests library. Returns response object or None on error."""
-        if not _HAS_REQUESTS:
-            logger.error("requests library not available")
-            return None
+        """POST request against the Enhance API. Returns response object or None on error."""
         url = f"{self._api_url}{path}"
         try:
-            return _requests.post(url, headers=self._headers(), json=body, timeout=10)
-        except _requests.RequestException as e:
+            with httpx.Client(http2=True, timeout=15) as client:
+                return client.post(url, headers=self._headers(), json=body)
+        except Exception as e:
             logger.error(f"POST {url} failed: {e}")
             return None
 

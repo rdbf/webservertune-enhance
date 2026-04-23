@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 
-import requests
+import httpx
 
 LOG_DIR     = "/var/local/enhance/webserver_logs"
 LOG_PATTERN = re.compile(r'"([^"]*)"')
@@ -334,7 +334,8 @@ def _probe_site(domain):
     import random
     url = f"https://{domain}/?probe={random.randint(1, 999999)}"
     try:
-        resp = requests.get(url, timeout=3, allow_redirects=True)
-        return resp.status_code
-    except requests.RequestException:
+        with httpx.Client(timeout=3, follow_redirects=True) as client:
+            resp = client.get(url)
+            return resp.status_code
+    except httpx.RequestError:
         return None

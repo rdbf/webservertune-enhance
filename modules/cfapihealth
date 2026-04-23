@@ -45,8 +45,9 @@ def run(config, logger, api_client):
         with registry_lock:
             snapshot = list(registry)
 
+        logger.info(f"cfapihealth: checking {len(snapshot)} CF-managed domain(s)")
+
         if not snapshot:
-            logger.debug("No CF-managed domains in registry, skipping health check")
             return
 
         # group by website_id to minimise API calls — one domains call per website

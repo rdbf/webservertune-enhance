@@ -7,6 +7,7 @@ Called by webservertune-enhance main program.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -18,6 +19,12 @@ OLS_CONF    = Path("/usr/local/lsws/conf/httpd_config.conf")
 OLS_LOG_DIR = Path("/var/local/enhance/webserver_logs")
 BACKUP_BASE = Path("/opt/webservertune-enhance/backups/ols")
 OLS_RESTART = ["/usr/local/lsws/bin/lswsctrl", "restart"]
+WWW_DIR     = Path("/var/www")
+
+UUID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE
+)
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +33,8 @@ OLS_RESTART = ["/usr/local/lsws/bin/lswsctrl", "restart"]
 
 class OLSSiteWatcher:
     """
-    Shared inotify-based registry of active OLS sites, driven by log file
-    creation and deletion in OLS_LOG_DIR. Consumers register callbacks for
+    Shared inotify-based registry of active OLS sites, driven by UUID webspace
+    directory creation and deletion in /var/www. Consumers register callbacks for
     site add and remove events.
     """
 
@@ -46,13 +53,13 @@ class OLSSiteWatcher:
             on_add(uuid)
 
     def start(self):
-        """Scan OLS_LOG_DIR for existing sites and start the inotify watcher thread."""
+        """Scan /var/www for existing UUID webspace directories and start the inotify watcher thread."""
         try:
-            for f in OLS_LOG_DIR.iterdir():
-                if f.suffix == ".log":
-                    self._known.add(f.stem)
+            for entry in os.listdir(WWW_DIR):
+                if UUID_RE.fullmatch(entry) and (WWW_DIR / entry).is_dir():
+                    self._known.add(entry)
         except OSError as e:
-            self._logger.error(f"[OLSSiteWatcher] Cannot scan {OLS_LOG_DIR}: {e}")
+            self._logger.error(f"[OLSSiteWatcher] Cannot scan {WWW_DIR}: {e}")
 
         t = threading.Thread(target=self._inotify_loop, daemon=True)
         t.start()
@@ -79,13 +86,14 @@ class OLSSiteWatcher:
             on_remove(uuid)
 
     def _inotify_loop(self):
-        """Watch OLS_LOG_DIR for log file creation and deletion to detect site changes."""
+        """Watch /var/www for UUID directory creation and deletion to detect site changes."""
         cmd = [
             "inotifywait", "--monitor", "--quiet",
             "--format", "%e %f",
             "--event", "create",
+            "--event", "moved_to",
             "--event", "delete",
-            str(OLS_LOG_DIR),
+            str(WWW_DIR),
         ]
         while True:
             try:
@@ -99,13 +107,16 @@ class OLSSiteWatcher:
                 if len(parts) != 2:
                     continue
                 event, fname = parts
-                if not fname.endswith(".log"):
+                if not UUID_RE.fullmatch(fname):
                     continue
-                uuid = fname[:-4]
-                if "CREATE" in event:
-                    self._fire_add(uuid)
+                if "CREATE" in event or "MOVED_TO" in event:
+                    if not (WWW_DIR / fname).is_dir():
+                        continue
+                    # brief delay to allow Enhance to finish setting up the webspace
+                    time.sleep(5)
+                    self._fire_add(fname)
                 elif "DELETE" in event:
-                    self._fire_remove(uuid)
+                    self._fire_remove(fname)
             proc.wait()
             self._logger.warning("[OLSSiteWatcher] inotifywait exited, restarting in 5s")
             time.sleep(5)

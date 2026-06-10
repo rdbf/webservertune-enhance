@@ -45,11 +45,9 @@ def setup_logger(name, log_level):
     """Create a named logger writing to both a log file and stdout."""
     log_file = LOG_DIR / f"{name}.log"
     logger   = logging.getLogger(name)
-    # getattr with fallback so an invalid log_level in config defaults to INFO
     level    = getattr(logging, log_level.upper(), logging.INFO)
     logger.setLevel(level)
 
-    # guard against duplicate handlers if setup_logger is called more than once for the same name
     if not logger.handlers:
         fmt = logging.Formatter(
             "%(asctime)s %(levelname).1s %(message)s",
@@ -71,17 +69,45 @@ def is_active(service):
         ["systemctl", "is-active", service],
         capture_output=True, text=True
     )
-    # include transient states to avoid false negatives mid-restart
     return result.stdout.strip() in ("active", "reloading", "activating", "deactivating")
 
 
+def is_enabled(service):
+    """Return True if the systemd service is enabled."""
+    result = subprocess.run(
+        ["systemctl", "is-enabled", service],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip() == "enabled"
+
+
 def detect_webserver():
-    """Return 'nginx', 'ols', or None depending on which webserver is active."""
-    if is_active("nginx"):
+    """
+    Return 'nginx', 'ols', or None based on enabled and active state.
+    is-enabled is the primary signal for intent; is-active confirms current state.
+    """
+    if is_enabled("nginx"):
         return "nginx"
-    if is_active("lshttpd"):
+    if is_enabled("lshttpd"):
         return "ols"
     return None
+
+
+def _wait_for_ols_active(config, logger):
+    """Poll until lshttpd is strictly active before starting OLS modules."""
+    debounce_secs = config.get("general", {}).get("debounce_seconds", 10)
+    for attempt in range(1, 11):
+        result = subprocess.run(
+            ["systemctl", "is-active", "lshttpd"],
+            capture_output=True, text=True
+        )
+        state = result.stdout.strip()
+        if state == "active":
+            logger.info(f"OLS confirmed active after {attempt} check(s)")
+            return
+        logger.debug(f"OLS readiness check {attempt}/10: {state}")
+        time.sleep(debounce_secs)
+    logger.warning("OLS did not reach active state after 10 checks — proceeding anyway")
 
 
 def load_module(name):
@@ -105,7 +131,6 @@ def main():
         print("ERROR: Must be run as root", file=sys.stderr)
         sys.exit(1)
 
-    # created here so log files are available before any module is loaded
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     config    = load_config()
@@ -125,14 +150,23 @@ def main():
     enhanceapi = load_module("enhanceapi")
     api_logger = setup_logger("enhanceapi", log_level)
     api_client = enhanceapi.EnhanceAPI(config, api_logger)
-    # initial build before any module thread starts so get_org_id() hits a warm cache
     api_client.build_org_cache(api_logger)
 
     if webserver == "nginx":
+        if not is_active("nginx"):
+            logger.warning("nginx is enabled but not active — running cleanup and attempting start")
+            nginxtune    = load_module("nginxtune")
+            nginx_logger = setup_logger("nginxtune", log_level)
+            nginxtune.cleanup(nginx_logger)
+            subprocess.run(["systemctl", "start", "nginx"], capture_output=True)
+            if not is_active("nginx"):
+                logger.error("nginx did not start after cleanup. Exiting.")
+                sys.exit(1)
+            logger.info("nginx started after cleanup")
+
         nginxtune    = load_module("nginxtune")
         nginx_logger = setup_logger("nginxtune", log_level)
 
-        # all module threads are daemon threads so they exit automatically when main exits
         t = threading.Thread(
             target=nginxtune.watch,
             args=(config, nginx_logger),
@@ -161,6 +195,8 @@ def main():
             t_redir.start()
 
     elif webserver == "ols":
+        _wait_for_ols_active(config, logger)
+
         olstune    = load_module("olstune")
         ols_logger = setup_logger("olstune", log_level)
 
@@ -239,12 +275,10 @@ def main():
             if len(parts) == 2 and parts[1] == CONFIG_FILE.name:
                 logger.warning("settings.conf changed, exiting for systemd restart")
                 logging.shutdown()
-                # os._exit bypasses Python cleanup to ensure immediate process termination
                 os._exit(0)
 
     threading.Thread(target=watch_config, daemon=True).start()
 
-    # poll for webserver changes; sys.exit is sufficient here as no logging flush is needed
     while True:
         time.sleep(DETECT_INTERVAL)
         current = detect_webserver()

@@ -1085,6 +1085,23 @@ def apply_client_max_body_size(config, logger):
 
 
 # ---------------------------------------------------------------------------
+# Cleanup — insert after apply_client_max_body_size(), before _site_confs()
+# ---------------------------------------------------------------------------
+
+def cleanup(logger):
+    """Strip all nginxtune-managed content from vhost confs and nginx.conf."""
+    logger.warning("nginxtune cleanup: resetting all vhost confs to defaults")
+    apply_nginx_conf(            {}, logger)
+    apply_http3_enable(          {}, logger)
+    apply_quic_gso_enable(       {}, logger)
+    apply_include_features(      {}, logger)
+    apply_logging_features(      {}, logger)
+    apply_fastcgi_cache_settings({}, logger)
+    apply_client_max_body_size(  {}, logger)
+    logger.warning("nginxtune cleanup: complete")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

@@ -176,34 +176,37 @@ def watch(config, logger, api_client):
             conds = item.get("conds", [])
             rule  = item.get("rule", {})
 
-            host_cond = next((c for c in conds if c.get("testString") == "%{HTTP_HOST}"), None)
-            uri_cond  = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
+            host_conds = [c for c in conds if c.get("testString") == "%{HTTP_HOST}"]
+            uri_cond   = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
 
-            if not host_cond:
+            if not host_conds:
                 logger.warning(f"Skipping rule with missing host condition: {item}")
                 continue
 
-            domain       = _extract_domain(host_cond["condPattern"])
             flags_str    = ",".join(rule.get("flags", []))
             pattern      = rule.get("pattern", ".*")
             substitution = rule.get("substitution", "")
 
-            rule_lines = [f'RewriteCond %{{HTTP_HOST}} {host_cond["condPattern"]} [NC]']
-
             if uri_cond:
-                rule_lines.append(f'RewriteCond %{{REQUEST_URI}} {uri_cond["condPattern"]} [NC]')
                 # strip %{REQUEST_URI} — the URI condition already handles matching;
                 # leaving it in would append the source path to the target
                 substitution = substitution.replace("%{REQUEST_URI}", "")
-            else:
-                # catch-all: protect .well-known paths from being redirected
-                rule_lines.append("RewriteCond %{REQUEST_URI} !^/.well-known/ [NC]")
 
-            rule_lines.append(f"RewriteRule {pattern} {substitution} [{flags_str}]")
+            for host_cond in host_conds:
+                domain     = _extract_domain(host_cond["condPattern"])
+                rule_lines = [f'RewriteCond %{{HTTP_HOST}} {host_cond["condPattern"]} [NC]']
 
-            if domain not in rules_by_domain:
-                rules_by_domain[domain] = []
-            rules_by_domain[domain].append("\n".join(rule_lines))
+                if uri_cond:
+                    rule_lines.append(f'RewriteCond %{{REQUEST_URI}} {uri_cond["condPattern"]} [NC]')
+                else:
+                    # catch-all: protect .well-known paths from being redirected
+                    rule_lines.append("RewriteCond %{REQUEST_URI} !^/.well-known/ [NC]")
+
+                rule_lines.append(f"RewriteRule {pattern} {substitution} [{flags_str}]")
+
+                if domain not in rules_by_domain:
+                    rules_by_domain[domain] = []
+                rules_by_domain[domain].append("\n".join(rule_lines))
 
         return rules_by_domain
 

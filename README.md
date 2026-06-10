@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.6.2  
+**Version:** 0.6.3  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -230,6 +230,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.6.3** — Fixes for all-domains redirects, OLS startup loop (port 7080 already busy), Nginx failed state on modified orphaned vhosts.
 
 **0.6.2** — Merge PR for fastcgiclear mu-plugin extra options. Bugfixes for API performance.
 

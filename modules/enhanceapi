@@ -13,7 +13,7 @@ from collections import deque
 import httpx
 
 # Maximum outgoing API requests per second
-_RATE_LIMIT = 5
+_RATE_LIMIT = 2
 
 
 class EnhanceAPI:

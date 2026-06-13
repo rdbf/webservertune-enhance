@@ -29,7 +29,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Security directives: Secure SSL/TLS versions, basic hardening, and basic CMS/WordPress protection
 - Persistent logging: Per-site access logs with optional Cloudflare real IP detection
 - FastCGI cache settings: Configurable inactive timeout and cache validity period
-- FastCGI clearing: Clear Nginx FastCGI cache directly from the filesystem when a WordPress update completes — no API dependency required
+- FastCGI clearing: Clear Nginx FastCGI cache directly from the filesystem when a WordPress update completes
 - Client Max Body Size: Configurable maximum upload and request body size
 - Redirects: Syncs and fixes redirect rules created in the Enhance UI to Nginx, per domain
 - Systemd service: Adds config to fix default restart behaviour (5x max, then "dead forever") to keep restarting at slower pace forever
@@ -231,9 +231,9 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Version History
 
-**0.6.4** — FastCGI cache clearing now works directly from the filesystem by scanning vhost configs for cache paths, removing the dependency on the Enhance API.
+**0.6.4** — FastCGI cache clearing directly from the filesystem, removing the dependency on the Enhance API.
 
-**0.6.3** — Fixes for all-domains redirects, OLS startup loop (port 7080 already busy), Nginx failed state on modified orphaned vhosts.
+**0.6.3** — Fixes for all-domains OLS redirects, OLS startup loop (port 7080 already busy), Nginx failed state on modified orphaned vhosts.
 
 **0.6.2** — Merge PR for fastcgiclear mu-plugin extra options. Bugfixes for API performance.
 
@@ -259,4 +259,5 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Contributors
 
-- [dalet11](https://github.com/dalet11) — FastCGI cache clearing: removed Enhance API dependency, implemented direct filesystem-based cache clearing
+- [andreik6v](https://github.com/andreik6v) — FastCGI cache clearing: Trigger on various situation where content changes are applied
+- [dalet11](https://github.com/dalet11) — FastCGI cache clearing: Removed Enhance API dependency

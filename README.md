@@ -30,6 +30,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Persistent logging: Per-site access logs with optional Cloudflare real IP detection
 - FastCGI cache settings: Configurable inactive timeout and cache validity period
 - FastCGI clearing: Clear Nginx FastCGI cache via the Enhance API when a WordPress update completes
+- Cache exclusions: Per-domain `skip_cache` rules beyond what the Enhance panel allows (custom login pages, REST API, `/.well-known`), plus WooCommerce store/cart/checkout/account rules applied automatically to detected WooCommerce sites
 - Client Max Body Size: Configurable maximum upload and request body size
 - Redirects: Syncs and fixes redirect rules created in the Enhance UI to Nginx, per domain
 - Systemd service: Adds config to fix default restart behaviour (5x max, then "dead forever") to keep restarting at slower pace forever
@@ -143,6 +144,18 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `false` | Load and start the fastcgiclear module — Nginx only. Installs mu-plugin that catches update notifications and sets a flag for cache clearing |
+
+### Nginx Cache Exclusions
+
+Settings under `[nginx-cacheexclude]`. Writes per-domain `skip_cache` rules to `/opt/webservertune-enhance/cache-excludes/<domain>.conf`, included into each vhost after its `vhost_includes` line. The rules run in Nginx's rewrite phase and only ever raise `$skip_cache` to `1`, extending Enhance's built-in exclusions rather than replacing them.
+
+Rules safe for any WordPress site are always written: custom login pages (`/login.*`), the REST API (`/wp-json/`), and `/.well-known.*`. WooCommerce rules (store/cart/checkout/account paths and the `woocommerce_items_in_cart` cookie) are written **only** to vhosts where WooCommerce is detected at the document root, because the cart-cookie rule would otherwise disable caching on non-WooCommerce sites. WooCommerce status is re-checked on vhost changes and on a periodic rescan, so installing WooCommerce later is picked up automatically.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Load and start the nginxcacheexclude module and inject the per-domain include — Nginx only |
+| `woocommerce` | `true` | Add WooCommerce-specific exclusions to detected WooCommerce sites |
+| `rescan_interval_seconds` | `21600` | Interval for re-detecting WordPress/WooCommerce status across all sites (6h default) |
 
 ### OLS Webserver Settings
 

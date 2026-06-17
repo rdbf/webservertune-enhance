@@ -160,6 +160,16 @@ def main():
             )
             t_redir.start()
 
+        if config.get("nginx-cacheexclude", {}).get("enabled", False):
+            nginxcacheexclude = load_module("nginxcacheexclude")
+            ce_logger         = setup_logger("nginxcacheexclude", log_level)
+            t_ce              = threading.Thread(
+                target=nginxcacheexclude.watch,
+                args=(config, ce_logger),
+                daemon=True
+            )
+            t_ce.start()
+
     elif webserver == "ols":
         olstune    = load_module("olstune")
         ols_logger = setup_logger("olstune", log_level)

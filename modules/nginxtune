@@ -21,6 +21,7 @@ NGINX_CONF    = Path("/etc/nginx/nginx.conf")
 BACKUP_BASE   = Path("/opt/webservertune-enhance/backups/nginx")
 OVERRIDES     = Path("/opt/webservertune-enhance/overrides")
 REDIRECTS_DIR = Path("/opt/webservertune-enhance/redirects")
+CACHE_EXCLUDES_DIR = Path("/opt/webservertune-enhance/cache-excludes")
 NGINX_DROPIN  = Path("/etc/systemd/system/nginx.service.d/webservertune-enhance.conf")
 ALT_SVC       = 'h3=":443"; ma=86400'
 
@@ -612,8 +613,12 @@ def apply_include_features(config, logger):
     from all non-default vhost confs. Inserts after the vhost_includes line,
     or before the closing brace if that line is absent.
     """
-    features     = config.get("nginx", {}).get("features", {})
-    redirects_on = config.get("general", {}).get("nginx_redirects", False)
+    features        = config.get("nginx", {}).get("features", {})
+    redirects_on    = config.get("general", {}).get("nginx_redirects", False)
+    cacheexclude_on = config.get("nginx-cacheexclude", {}).get("enabled", False)
+
+    if cacheexclude_on:
+        CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
 
     include_map = {
         "ssl_upgrade":      f"include {OVERRIDES}/ssl.conf",
@@ -630,6 +635,19 @@ def apply_include_features(config, logger):
     for cf in conf_files:
         filename     = cf.name
         redirect_inc = f"include {REDIRECTS_DIR}/{cf.stem}.conf"
+        cacheexc_inc = f"include {CACHE_EXCLUDES_DIR}/{cf.stem}.conf"
+
+        # Ensure the per-domain cache-exclude file exists before its include is
+        # added, otherwise nginx -t fails on a missing include path. The
+        # nginxcacheexclude module fills in the real rules; an empty placeholder
+        # is valid in the meantime.
+        if cacheexclude_on:
+            ce_path = CACHE_EXCLUDES_DIR / f"{cf.stem}.conf"
+            if not ce_path.exists():
+                try:
+                    ce_path.write_text("")
+                except Exception as e:
+                    logger.error(f"Failed to create placeholder cache-exclude for {cf.stem}: {e}")
 
         try:
             lines = cf.read_text().splitlines(keepends=True)
@@ -637,8 +655,10 @@ def apply_include_features(config, logger):
             logger.error(f"Failed to read {filename}: {e}")
             continue
 
-        file_expected   = expected + ([redirect_inc] if redirects_on else [])
-        file_manageable = manageable + [redirect_inc]
+        file_expected   = (expected
+                           + ([redirect_inc] if redirects_on else [])
+                           + ([cacheexc_inc] if cacheexclude_on else []))
+        file_manageable = manageable + [redirect_inc, cacheexc_inc]
 
         current  = []
         unwanted = []
@@ -650,6 +670,9 @@ def apply_include_features(config, logger):
                 continue
             if s.rstrip(";") == redirect_inc:
                 current.append(redirect_inc)
+                continue
+            if s.rstrip(";") == cacheexc_inc:
+                current.append(cacheexc_inc)
                 continue
             inc_filename = Path(s.rstrip(";").split()[-1]).name
             if inc_filename not in managed_filenames:
@@ -704,11 +727,15 @@ def apply_include_features(config, logger):
                 names = [k for k, v in include_map.items() if v in to_add]
                 if redirect_inc in to_add:
                     names.append("nginx_redirects")
+                if cacheexc_inc in to_add:
+                    names.append("cache_exclude")
                 parts.append(f"added {', '.join(names)}")
             if to_remove:
                 names = [k for k, v in include_map.items() if v in to_remove]
                 if redirect_inc in to_remove:
                     names.append("nginx_redirects")
+                if cacheexc_inc in to_remove:
+                    names.append("cache_exclude")
                 parts.append(f"removed {', '.join(names)}")
             if unwanted:
                 parts.append(f"cleaned {len(unwanted)} legacy includes")

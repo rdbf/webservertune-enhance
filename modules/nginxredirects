@@ -74,47 +74,45 @@ def watch(config, logger, api_client):
             conds = item.get("conds", [])
             rule  = item.get("rule", {})
 
-            host_cond = next((c for c in conds if c.get("testString") == "%{HTTP_HOST}"), None)
-            uri_cond  = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
+            host_conds = [c for c in conds if c.get("testString") == "%{HTTP_HOST}"]
+            uri_cond   = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
 
-            if not host_cond:
+            if not host_conds:
                 logger.warning(f"Skipping rule with missing host condition: {item}")
                 continue
 
-            domain = _extract_domain(host_cond["condPattern"])
-            flags  = rule.get("flags", [])
-            code   = next((f.split("=")[1] for f in flags if f.startswith("R=")), "301")
+            flags = rule.get("flags", [])
+            code  = next((f.split("=")[1] for f in flags if f.startswith("R=")), "301")
 
-            if not uri_cond:
+            if uri_cond:
+                pattern = uri_cond["condPattern"]
+
+                if "?" in pattern:
+                    logger.warning(
+                        f"Skipping '{pattern}' — "
+                        f"query string conditions are not supported in Nginx"
+                    )
+                    continue
+
+                target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$1")
+                rule_str = (
+                    f"location ~ ^{pattern}(.*)$ {{\n"
+                    f"    return {code} {target};\n"
+                    f"}}"
+                )
+            else:
                 target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$request_uri")
-                if domain not in rules_by_domain:
-                    rules_by_domain[domain] = []
-                rules_by_domain[domain].append(
+                rule_str = (
                     f"location ~ ^(?!/.well-known)(.*)$ {{\n"
                     f"    return {code} {target};\n"
                     f"}}"
                 )
-                continue
 
-            pattern = uri_cond["condPattern"]
-
-            if "?" in pattern:
-                logger.warning(
-                    f"[{domain}] Skipping '{pattern}' — "
-                    f"query string conditions are not supported in Nginx"
-                )
-                continue
-
-            target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$1")
-
-            if domain not in rules_by_domain:
-                rules_by_domain[domain] = []
-
-            rules_by_domain[domain].append(
-                f"location ~ ^{pattern}(.*)$ {{\n"
-                f"    return {code} {target};\n"
-                f"}}"
-            )
+            for host_cond in host_conds:
+                domain = _extract_domain(host_cond["condPattern"])
+                if domain not in rules_by_domain:
+                    rules_by_domain[domain] = []
+                rules_by_domain[domain].append(rule_str)
 
         return rules_by_domain
 

@@ -245,7 +245,7 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Version History
 
-**0.7.0** — Merge PR for fastcgi cache exclusions.
+**0.7.0** — Merge PR for fastcgi cache exclusions. Fix multi-domain rewrites for Nginx.
 
 **0.6.4** — FastCGI cache clearing directly from the filesystem, removing the dependency on the Enhance API.
 

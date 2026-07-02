@@ -4,6 +4,7 @@ settings.conf
 # Other generated content
 backups/
 redirects/
+cache-excludes/
 
 # Python cache
 __pycache__/

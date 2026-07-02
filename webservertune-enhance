@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 webservertune-enhance
-Detects the active webserver and starts the appropriate modules.
+Detects the active webserver type and state and starts the appropriate modules.
 Monitors for webserver changes and restarts via systemd if detected.
 """
 

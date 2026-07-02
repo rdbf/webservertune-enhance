@@ -27,10 +27,8 @@ real_ip_logging           = false
 fastcgi_cache_inactive    = "60m"
 fastcgi_cache_valid       = "60m"
 client_max_body_size      = "200m"
-
 [nginx-fastcgiclear]
 enabled = false
-
 [nginx-cacheexclude]
 enabled     = false
 woocommerce = true
@@ -39,7 +37,6 @@ woocommerce = true
 #cpuAffinity  = "1"
 #enableLVE    = "0"
 #inMemBufSize = "128M"
-
 [ols.tuning]
 #sndBufSize         = "512K"
 #rcvBufSize         = "512K"
@@ -48,7 +45,6 @@ woocommerce = true
 #quicEnable         = "1"
 #quicVersions       = "h3"
 #quicCongestionCtrl = "2"
-
 ["ols"."errorlog logs/error.log"]
 #logLevel        = "WARN"
 #debugLevel      = "0"
@@ -56,12 +52,10 @@ woocommerce = true
 #keepDays        = "7"
 #compressArchive = "1"
 #enableStderrLog = "1"
-
 ["ols"."accesslog logs/access.log"]
 #rollingSize     = "25M"
 #keepDays        = "7"
 #compressArchive = "1"
-
 [ols-503fix]
 window_seconds   = 30
 min_503_count    = 5
@@ -69,7 +63,6 @@ min_503_percent  = 50
 last_n_requests  = 10
 cooldown_seconds = 60
 scan_interval    = 1
-
 [ols-lsapi]
 enabled              = false
 children_below_nproc = 3

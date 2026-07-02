@@ -31,6 +31,10 @@ client_max_body_size      = "200m"
 [nginx-fastcgiclear]
 enabled = false
 
+[nginx-cacheexclude]
+enabled     = false
+woocommerce = true
+
 [ols.general]
 #cpuAffinity  = "1"
 #enableLVE    = "0"

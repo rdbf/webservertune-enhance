@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+nginxcacheexclude
+Generates per-domain FastCGI cache-exclude include files for Enhance vhosts.
+
+Enhance's panel only allows simple URI prefixes to be excluded from the FastCGI
+cache. This sub-module writes additional skip_cache rules — covering custom
+login pages, the REST API, /.well-known, and (when detected) WooCommerce
+store/cart pages — into /opt/webservertune-enhance/cache-excludes/<domain>.conf.
+
+The Enhance-generated vhost already does `set $skip_cache 0;` at server scope and
+reads it via `fastcgi_cache_bypass $skip_cache;` inside the PHP location.
+nginxtune.apply_include_features() injects `include .../cache-excludes/<domain>.conf;`
+after the `include vhost_includes/<domain>.conf;` line. These rules run in the
+rewrite phase and only ever raise $skip_cache to 1, so they add bypass conditions
+but never re-enable caching.
+
+WooCommerce-specific rules are written ONLY for vhosts where WooCommerce is
+detected, because the `woocommerce_items_in_cart` cookie rule would otherwise
+disable caching entirely on non-WooCommerce sites.
+
+This module does not modify vhosts, reload nginx, or run any threads of its own.
+It exposes a single apply() function that nginxtune calls from within its
+run()/cleanup() flow, so file generation participates in nginxtune's existing
+backup → nginx -t → reload/restore safety net.
+"""
+
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+SITES_DIR          = Path("/etc/nginx/sites-enabled")
+CACHE_EXCLUDES_DIR = Path("/opt/webservertune-enhance/cache-excludes")
+
+# Rules that are safe on ANY WordPress site (URI-only, no cookie logic).
+SAFE_RULES = [
+    "# Custom login pages (wp-login.php is already covered by Enhance's wp-.*.php rule)",
+    'if ($request_uri ~* "/login.*") {',
+    "    set $skip_cache 1;",
+    "}",
+    "",
+    "# WordPress REST API",
+    'if ($request_uri ~* "/wp-json/") {',
+    "    set $skip_cache 1;",
+    "}",
+    "",
+    "# .well-known (security.txt, apple-app-site-association, etc.)",
+    'if ($request_uri ~* "/.well-known.*") {',
+    "    set $skip_cache 1;",
+    "}",
+]
+
+# Rules that must ONLY be applied to detected WooCommerce sites.
+WOOCOMMERCE_RULES = [
+    "# WooCommerce: never cache store, cart, checkout, or account pages",
+    'if ($request_uri ~* "/cart.*|/checkout.*|/my-account.*|/store.*|/addons.*") {',
+    "    set $skip_cache 1;",
+    "}",
+    "",
+    "# WooCommerce: skip cache only when the cart actually contains items.",
+    "# The item count cookie is \"0\" for an empty cart and absent entirely for",
+    "# visitors who have never touched the store. Matching != \"0\" would also be",
+    "# true for an ABSENT cookie (nginx reads it as an empty string), bypassing",
+    "# cache on every uncookied request and disabling caching site-wide. ^[1-9]",
+    "# matches a real non-zero count and ignores both \"0\" and the empty string.",
+    'if ($cookie_woocommerce_items_in_cart ~ "^[1-9]") {',
+    "    set $skip_cache 1;",
+    "}",
+]
+
+HEADER = "# Managed by webservertune-enhance (nginx-cacheexclude). Do not edit by hand."
+
+
+# ---------------------------------------------------------------------------
+# Vhost helpers
+# ---------------------------------------------------------------------------
+
+def _site_confs():
+    """Return all vhost conf files, excluding the control panel 000- prefix and default.conf."""
+    try:
+        return [
+            f for f in SITES_DIR.glob("*.conf")
+            if not f.name.startswith("000-") and f.name != "default.conf"
+        ]
+    except Exception:
+        return []
+
+
+def _docroot_from_conf(cf):
+    """Extract the document root from a vhost's `root "...";` directive."""
+    try:
+        for line in cf.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("root "):
+                val = s[len("root "):].strip().rstrip(";").strip().strip('"').strip("'")
+                return Path(val)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WordPress / WooCommerce detection
+# ---------------------------------------------------------------------------
+
+def _detect(docroot):
+    """
+    Return (is_wordpress, is_woocommerce) for a document root.
+    Checks the docroot itself and its immediate subdirectories (covers WP
+    installed in a subdirectory) without recursing into large trees.
+    """
+    if not docroot or not docroot.is_dir():
+        return (False, False)
+
+    candidates = [docroot]
+    try:
+        candidates += [d for d in docroot.iterdir()
+                       if d.is_dir() and not d.name.startswith(".")]
+    except Exception:
+        pass
+
+    is_wp = False
+    is_wc = False
+    for root in candidates:
+        try:
+            if (root / "wp-load.php").exists():
+                is_wp = True
+                wc = root / "wp-content" / "plugins" / "woocommerce" / "woocommerce.php"
+                if wc.exists():
+                    is_wc = True
+                    break
+        except Exception:
+            continue
+    return (is_wp, is_wc)
+
+
+# ---------------------------------------------------------------------------
+# Content generation
+# ---------------------------------------------------------------------------
+
+def _build_content(is_wp, is_wc, woocommerce_on):
+    """Build the conf file body for a domain. Empty string for non-WordPress sites."""
+    if not is_wp:
+        return ""
+    blocks = [HEADER, ""] + SAFE_RULES
+    if is_wc and woocommerce_on:
+        blocks += [""] + WOOCOMMERCE_RULES
+    return "\n".join(blocks) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Entry point — called by nginxtune.run() / nginxtune.cleanup()
+# ---------------------------------------------------------------------------
+
+def _remove_all(logger):
+    """Remove every generated cache-exclude file. Returns True if any were removed."""
+    changed = False
+    if not CACHE_EXCLUDES_DIR.is_dir():
+        return False
+    for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
+        try:
+            conf.unlink()
+            logger.info(f"Removed cache-exclude conf: {conf.name}")
+            changed = True
+        except Exception as e:
+            logger.error(f"Failed to remove {conf.name}: {e}")
+    return changed
+
+
+def apply(config, logger):
+    """
+    Regenerate per-domain cache-exclude include files to match the current set of
+    vhosts and their detected WordPress/WooCommerce status. Writes only changed
+    files and removes stale ones. Does NOT reload nginx — nginxtune validates and
+    reloads after all apply_* steps.
+
+    When the feature is disabled (or config is empty, as in nginxtune.cleanup()),
+    all generated files are removed so the include lines nginxtune strips no longer
+    point at anything.
+
+    Returns True if any file was written or removed.
+    """
+    section        = config.get("nginx-cacheexclude", {})
+    enabled        = section.get("enabled", False)
+    woocommerce_on = section.get("woocommerce", True)
+
+    if not enabled:
+        return _remove_all(logger)
+
+    CACHE_EXCLUDES_DIR.mkdir(parents=True, exist_ok=True)
+
+    confs        = _site_confs()
+    current_doms = {cf.stem for cf in confs}
+
+    # Detection is filesystem stat work — parallelise across sites.
+    def detect_one(cf):
+        return (cf.stem, _detect(_docroot_from_conf(cf)))
+
+    detected = {}
+    try:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for domain, flags in ex.map(detect_one, confs):
+                detected[domain] = flags
+    except Exception as e:
+        logger.error(f"cache-exclude detection failed: {e}")
+        return False
+
+    changed = False
+
+    for cf in confs:
+        is_wp, is_wc = detected.get(cf.stem, (False, False))
+        path     = CACHE_EXCLUDES_DIR / f"{cf.stem}.conf"
+        new      = _build_content(is_wp, is_wc, woocommerce_on)
+        existing = path.read_text() if path.exists() else None
+        if existing == new:
+            continue
+        try:
+            path.write_text(new)
+            kind = ("with WooCommerce" if (is_wc and woocommerce_on)
+                    else "WordPress" if is_wp else "empty (non-WordPress)")
+            logger.warning(f"cache-exclude: updated {cf.stem}.conf ({kind})")
+            changed = True
+        except Exception as e:
+            logger.error(f"Failed to write {path.name}: {e}")
+
+    # Remove confs for domains that no longer have a vhost.
+    for conf in CACHE_EXCLUDES_DIR.glob("*.conf"):
+        if conf.stem not in current_doms:
+            try:
+                conf.unlink()
+                logger.warning(f"cache-exclude: removed stale {conf.name}")
+                changed = True
+            except Exception as e:
+                logger.error(f"Failed to remove {conf.name}: {e}")
+
+    return changed

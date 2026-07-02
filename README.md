@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.6.4  
+**Version:** 0.7.0  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -8,7 +8,7 @@
 
 webservertune-enhance is an automated configuration service for Enhance hosting control panel servers that handles both Nginx and OpenLiteSpeed webservers. It monitors for configuration changes and re-applies settings automatically without manual intervention, adding features and resolving limitations in how Enhance implements each webserver.
 
-Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.22.2.
+Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.23.1.
 
 ## Features
 
@@ -245,6 +245,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Version History
 
+**0.7.0** — Merge PR for fastcgi cache exclusions.
+
 **0.6.4** — FastCGI cache clearing directly from the filesystem, removing the dependency on the Enhance API.
 
 **0.6.3** — Fixes for all-domains OLS redirects, OLS startup loop (port 7080 already busy), Nginx failed state on modified orphaned vhosts.
@@ -273,5 +275,5 @@ Adjust settings as required, as this config saves 15 weekly logs.
 
 ## Contributors
 
-- [andreik6v](https://github.com/andreik6v) — FastCGI cache clearing: Trigger on various situations where content changes are applied.
+- [andreik6v](https://github.com/andreik6v) — FastCGI cache clearing: Trigger on various situations where content changes are applied. FastCGI exclusions.
 - [dalet11](https://github.com/dalet11) — FastCGI cache clearing: Removed Enhance API dependency.

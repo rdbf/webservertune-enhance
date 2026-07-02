@@ -123,6 +123,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `nginx_redirects` | `false` | Sync Enhance UI redirect rules to Nginx include files, per domain |
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
 | `ols_redirects` | `false` | Sync Enhance UI redirect rules to per-domain `.htaccess` files |
+| `ols_restart_manage` | `false` | Mitigates OLS restart loop due to "busy port 7080 bug" by checking restart count, stopping lshttpd. Needs automated restart after stopping (by cPFence for example) |
 | `backup_retention_days` | `30` | Days to retain backups in `backups/nginx/` and `backups/ols/` |
 
 ### Nginx

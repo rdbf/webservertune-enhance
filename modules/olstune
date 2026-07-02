@@ -6,6 +6,7 @@ Enforces key/value pairs defined in settings.conf whenever the file changes.
 Called by webservertune-enhance main program.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,9 @@ OLS_LOG_DIR = Path("/var/local/enhance/webserver_logs")
 BACKUP_BASE = Path("/opt/webservertune-enhance/backups/ols")
 OLS_RESTART = ["/usr/local/lsws/bin/lswsctrl", "restart"]
 WWW_DIR     = Path("/var/www")
+
+RESTART_GUARD_INTERVAL   = 60
+RESTART_GUARD_THRESHOLD  = 2
 
 UUID_RE = re.compile(
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
@@ -123,12 +127,67 @@ class OLSSiteWatcher:
 
 
 # ---------------------------------------------------------------------------
+# Restart guard — polls lshttpd's systemd restart counter
+# ---------------------------------------------------------------------------
+
+def _get_ols_nrestarts(logger):
+    """Return the current NRestarts value for lshttpd.service, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "lshttpd", "-p", "NRestarts"],
+            capture_output=True, text=True
+        )
+        line = result.stdout.strip()
+        if "=" in line:
+            return int(line.split("=", 1)[1])
+    except Exception as e:
+        logger.error(f"Failed to read lshttpd NRestarts: {e}")
+    return None
+
+
+def _restart_guard_loop(logger):
+    """
+    Poll lshttpd's systemd restart counter every RESTART_GUARD_INTERVAL seconds.
+    If NRestarts reaches RESTART_GUARD_THRESHOLD, OLS is treated as crash-looping:
+    stop lshttpd, reset its failed/restart state, and exit this process so systemd
+    restarts webservertune-enhance and re-enters the OLS readiness wait from scratch.
+    """
+    while True:
+        time.sleep(RESTART_GUARD_INTERVAL)
+
+        nrestarts = _get_ols_nrestarts(logger)
+        if nrestarts is None:
+            continue
+
+        if nrestarts >= RESTART_GUARD_THRESHOLD:
+            logger.warning(
+                f"lshttpd NRestarts={nrestarts} >= {RESTART_GUARD_THRESHOLD} — "
+                "treating as crash loop, stopping lshttpd"
+            )
+            try:
+                subprocess.run(["systemctl", "stop", "lshttpd"], capture_output=True)
+                subprocess.run(["systemctl", "reset-failed", "lshttpd"], capture_output=True)
+            except Exception as e:
+                logger.error(f"Failed to stop/reset lshttpd: {e}")
+
+            logger.warning("Exiting webservertune-enhance for systemd restart")
+            logging.shutdown()
+            os._exit(0)
+
+
+# ---------------------------------------------------------------------------
 # inotify watch + debounce
 # ---------------------------------------------------------------------------
 
 def watch(config, logger, site_watcher):
     """Entry point called by main program. Runs startup check then watches for changes."""
     logger.info("olstune starting")
+
+    if config.get("general", {}).get("ols_restart_manage", False):
+        threading.Thread(target=_restart_guard_loop, args=(logger,), daemon=True).start()
+    else:
+        logger.debug("ols_restart_manage disabled, restart guard not started")
+
     run(config, logger)
 
     _start_ols_log_threads(config, logger, site_watcher)

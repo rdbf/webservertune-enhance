@@ -67,7 +67,46 @@ class OLSSiteWatcher:
 
         t = threading.Thread(target=self._inotify_loop, daemon=True)
         t.start()
+
+        rt = threading.Thread(target=self._reconcile_loop, daemon=True)
+        rt.start()
+
         self._logger.info(f"[OLSSiteWatcher] Started, {len(self._known)} sites found")
+
+    def _reconcile_loop(self):
+        """Rescan /var/www periodically and re-fire add/remove for any drift."""
+        interval = 300
+        while True:
+            time.sleep(interval)
+            try:
+                on_disk = {
+                    e for e in os.listdir(WWW_DIR)
+                    if UUID_RE.fullmatch(e) and (WWW_DIR / e).is_dir()
+                }
+            except OSError as e:
+                self._logger.error(f"[OLSSiteWatcher] Reconcile scan failed: {e}")
+                continue
+
+            with self._lock:
+                known = set(self._known)
+                self._known = on_disk
+                consumers = list(self._consumers)
+
+            for uuid in on_disk - known:
+                self._logger.info(f"[OLSSiteWatcher] Reconcile: site added {uuid}")
+                for on_add, _ in consumers:
+                    try:
+                        on_add(uuid)
+                    except Exception as e:
+                        self._logger.error(f"[OLSSiteWatcher] on_add({uuid}) failed: {e}")
+
+            for uuid in known - on_disk:
+                self._logger.info(f"[OLSSiteWatcher] Reconcile: site removed {uuid}")
+                for _, on_remove in consumers:
+                    try:
+                        on_remove(uuid)
+                    except Exception as e:
+                        self._logger.error(f"[OLSSiteWatcher] on_remove({uuid}) failed: {e}")
 
     def _fire_add(self, uuid):
         """Add a UUID to the known set and notify all consumers."""

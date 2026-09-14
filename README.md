@@ -1,6 +1,6 @@
 # webservertune-enhance
 
-**Version:** 0.7.0  
+**Version:** 0.7.1  
 **Location:** `/opt/webservertune-enhance/`  
 **Author:** rdbf
 
@@ -8,7 +8,7 @@
 
 webservertune-enhance is an automated configuration service for Enhance hosting control panel servers that handles both Nginx and OpenLiteSpeed webservers. It monitors for configuration changes and re-applies settings automatically without manual intervention, adding features and resolving limitations in how Enhance implements each webserver.
 
-Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.23.1.
+Future Enhance updates might break functionality, although checks are in place to prevent this. The service is compatible with all Enhance v12 releases, up to and including 12.25.10.
 
 ## Features
 
@@ -47,7 +47,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Enhance hosting environment
 - Python 3.11+ (default on Ubuntu 24.04)
 - Dependencies: `apt install inotify-tools python3-httpx python3-h2`
-- Enhance installed updated Nginx (1.30.2) or OpenLiteSpeed (1.9.0)
+- Enhance installed updated Nginx (1.30.2) or OpenLiteSpeed (1.9.2)
 
 ## Installation
 
@@ -245,6 +245,8 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
 
 ## Version History
+
+**0.7.1** — Fix for where moved websites were not picked up for persistent logging until service restart on OLS.
 
 **0.7.0** — Merge PR for fastcgi cache exclusions. Fix multi-domain rewrites for Nginx. Added OLS restart manage option, related to startup loop bug. Config format changed.
 

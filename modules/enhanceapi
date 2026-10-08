@@ -161,6 +161,13 @@ class EnhanceAPI:
         If a build is already in progress, waits for it to complete then returns
         without making any API calls — the cache will have been refreshed.
         Records build time on every successful build.
+
+        The mapping is assembled from two independent sources and unioned, so a
+        site is cached if EITHER source returns it:
+          1. the master-org recursive websites listing, and
+          2. an explicit walk of the org tree (MO -> all customers, recursively),
+             listing each org's own websites.
+        Source 2 is what reaches websites owned by resellers / nested customers.
         """
         acquired = self._build_lock.acquire(blocking=False)
         if not acquired:
@@ -172,10 +179,11 @@ class EnhanceAPI:
         try:
             for attempt in range(1, 6):
                 websites = {}
-                offset   = 0
                 limit    = 100
                 failed   = False
 
+                # --- source 1: master-org recursive listing -------------------
+                offset = 0
                 while True:
                     data = self.get(
                         f"/orgs/{self._org_id}/websites"
@@ -187,10 +195,48 @@ class EnhanceAPI:
                         break
                     for site in data.get("items", []):
                         websites[site["id"]] = site["orgId"]
-                    total = data.get("total", 0)
                     offset += limit
-                    if offset >= total:
+                    if offset >= data.get("total", 0):
                         break
+
+                # --- source 2: org-tree walk (MO + all nested customers) ------
+                if not failed:
+                    org_ids = {self._org_id}
+                    offset  = 0
+                    while True:
+                        data = self.get(
+                            f"/orgs/{self._org_id}/customers"
+                            f"?recursive=true&offset={offset}&limit={limit}",
+                            logger
+                        )
+                        if data is None:
+                            failed = True
+                            break
+                        for cust in data.get("items", []):
+                            org_ids.add(cust["id"])
+                        offset += limit
+                        if offset >= data.get("total", 0):
+                            break
+
+                    if not failed:
+                        for cust_org in org_ids:
+                            offset = 0
+                            while True:
+                                data = self.get(
+                                    f"/orgs/{cust_org}/websites"
+                                    f"?offset={offset}&limit={limit}",
+                                    logger
+                                )
+                                if data is None:
+                                    failed = True
+                                    break
+                                for site in data.get("items", []):
+                                    websites[site["id"]] = cust_org
+                                offset += limit
+                                if offset >= data.get("total", 0):
+                                    break
+                            if failed:
+                                break
 
                 if not failed:
                     with self._org_cache_lock:

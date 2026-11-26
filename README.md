@@ -136,6 +136,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `server_hardening` | `false` | Include `overrides/hardening.conf` — basic server hardening rules |
 | `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
 | `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` in `[general]` |
+| `connection_ip_logging` | `false` | Append the TCP peer address (`$realip_remote_addr`) and the Cloudflare Ray ID (`$http_cf_ray`) to the persistent log format, so you can tell requests that came through Cloudflare from direct-to-origin requests and spot spoofed `CF-Connecting-IP` / `X-Forwarded-For` values. Requires `persistent_logging = true` in `[general]` |
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
@@ -208,7 +209,7 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 
 ### Persistent Logging
 
-When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
+When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. When `connection_ip_logging` is enabled, two fields are appended at the end of each Nginx line: the address of the TCP connection before any real IP substitution (`$realip_remote_addr`), and the Cloudflare Ray ID (`$http_cf_ray`, `-` when absent). A request whose connection address is not a Cloudflare IP and has no Ray ID reached the origin directly. The first 12 fields are unchanged, so existing parsers keep working. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
 
 When `persistent_php_logs` is enabled, PHP logs are written to `/var/www/<UUID>/logs/php.log` - php-error.log for both webservers and php-fpm.log for Nginx.
 

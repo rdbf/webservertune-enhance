@@ -781,6 +781,29 @@ def apply_include_features(config, logger):
 # apply_logging_features
 # ---------------------------------------------------------------------------
 
+def _persistent_log_format(fmt_name, ip_var, conn_ip_on):
+    """
+    Build the persistent log_format line for a vhost.
+
+    With conn_ip_on, two fields are appended at the end (so parsers reading the
+    first 12 fields keep working): the address of the TCP peer before the realip
+    module rewrites it ($realip_remote_addr) and the Cloudflare Ray ID. Together
+    they show whether a request really came through Cloudflare or went straight
+    to the origin, and expose spoofed CF-Connecting-IP / X-Forwarded-For values.
+    """
+    fmt = (
+        f"log_format {fmt_name}_persistent "
+        f"'$time_local - {ip_var} - $http_cf_ipcountry - "
+        f"$server_protocol - $status - $request_method - "
+        f"$host - $request_uri - $http_user_agent - "
+        f"$upstream_cache_status - $request_time - "
+        f"$upstream_response_time"
+    )
+    if conn_ip_on:
+        fmt += " - $realip_remote_addr - $http_cf_ray"
+    return fmt + "';\n"
+
+
 def apply_logging_features(config, logger):
     """
     Add or remove persistent access logging and real IP detection across all
@@ -791,6 +814,7 @@ def apply_logging_features(config, logger):
     features    = config.get("nginx", {}).get("features", {})
     pers_on     = general.get("persistent_logging", False)
     realip_on   = features.get("real_ip_logging", False)
+    conn_ip_on  = features.get("connection_ip_logging", False)
     # ip_var is derived once here; all format strings must use this variable consistently
     ip_var      = "$actual_addr" if realip_on else "$remote_addr"
 
@@ -833,13 +857,18 @@ def apply_logging_features(config, logger):
         cur_pers   = has_pers_log and has_pers_fmt
         cur_realip = has_realip_map and has_realip_fmt
 
-        # check if the persistent format uses the correct ip_var for the current settings
+        # check if the persistent format matches the current settings exactly
+        # (a substring check on ip_var is not enough: "$remote_addr" is also
+        # contained in "$realip_remote_addr")
         pers_fmt_correct = True
         if pers_on and has_pers_fmt:
             for line in lines:
                 s = line.strip()
                 if "log_format" in s and "_persistent" in s:
-                    if ip_var not in s:
+                    parts = s.split()
+                    fmt_name = parts[1][:-len("_persistent")] if len(parts) >= 2 else ""
+                    expected = _persistent_log_format(fmt_name, ip_var, conn_ip_on).strip()
+                    if s != expected:
                         pers_fmt_correct = False
                     break
 
@@ -885,15 +914,7 @@ def apply_logging_features(config, logger):
                         parts = s.split()
                         if len(parts) >= 2:
                             fmt_name = parts[1]
-                            pers_fmt = (
-                                f"log_format {fmt_name}_persistent "
-                                f"'$time_local - {ip_var} - $http_cf_ipcountry - "
-                                f"$server_protocol - $status - $request_method - "
-                                f"$host - $request_uri - $http_user_agent - "
-                                f"$upstream_cache_status - $request_time - "
-                                f"$upstream_response_time';\n"
-                            )
-                            new_lines.append(pers_fmt)
+                            new_lines.append(_persistent_log_format(fmt_name, ip_var, conn_ip_on))
                             pers_fmt_added = True
                     except Exception:
                         pass
@@ -938,6 +959,8 @@ def apply_logging_features(config, logger):
                 parts.append(f"persistent logging {'enabled' if pers_on else 'disabled'}")
             if cur_realip != realip_on:
                 parts.append(f"real IP logging {'enabled' if realip_on else 'disabled'}")
+            if not parts and not pers_fmt_correct:
+                parts.append("persistent log format updated")
             logger.warning(f"logging_features: {'; '.join(parts)} — {filename}")
             any_changed = True
         except Exception as e:

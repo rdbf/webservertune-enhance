@@ -134,7 +134,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `quic_directives_enable` | `false` | QUIC performance directives written to nginx.conf — requires `http3_enable = true` |
 | `ssl_upgrade` | `false` | Include `overrides/ssl.conf` — modern TLS settings |
 | `server_hardening` | `false` | Include `overrides/hardening.conf` — basic server hardening rules |
-| `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
+| `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress protection rules: deny `wp-config*`, readme/license/changelog files, PHP in `wp-content/uploads` (and cache/upgrade/backup dirs) and direct PHP in `wp-includes` (except the TinyMCE loader and `ms-files.php`). `xmlrpc.php` is not blocked, because Jetpack and the mobile apps need it |
 | `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` in `[general]` |
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |

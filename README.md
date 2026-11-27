@@ -136,6 +136,7 @@ All settings are controlled through `settings.conf` in TOML format. All features
 | `server_hardening` | `false` | Include `overrides/hardening.conf` — basic server hardening rules |
 | `cms_protection` | `false` | Include `overrides/cms.conf` — WordPress and CMS protection rules |
 | `real_ip_logging` | `false` | Log real visitor IPs via Cloudflare headers — requires `persistent_logging = true` in `[general]` |
+| `json_logging` | `false` | Write the Nginx persistent log as one JSON object per request (`log_format ... escape=json`), so a client cannot shift or inject fields through the User-Agent, referer or URL. Fields: `time`, `msec`, `ip`, `peer` (`$realip_remote_addr`), `cf_ray`, `country`, `host`, `method`, `uri`, `protocol`, `status`, `bytes_sent`, `body_bytes`, `request_bytes`, `referer`, `ua`, `cache`, `request_time`, `upstream_time`; all values are strings, unset ones are `""`. This covers every field of the Enhance access log (`/var/local/enhance/webserver_logs/`) and of the text format. Requires `persistent_logging = true` in `[general]`. Switching it on or off rewrites the format line in place |
 | `fastcgi_cache_inactive` | `60m` | FastCGI cache inactive timeout |
 | `fastcgi_cache_valid` | `60m` | FastCGI cache validity period |
 | `client_max_body_size` | `200m` | Maximum upload and request body size |
@@ -209,6 +210,8 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 ### Persistent Logging
 
 When `persistent_logging` is enabled, access logs are written to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log`, a root-owned directory (root:adm, 0750) outside the webspace. The Nginx worker user (from the `user` directive, default `www-data`) gets search-only access through an ACL (`u:www-data:x`), because workers reopen log files themselves on `SIGUSR1`. Any `access_log` pointing below `/var/www/` is removed from the vhosts; with persistent logging enabled it is replaced by the new location. Persistent logging is only added to a vhost that has the Enhance access log with a valid webspace UUID and a `log_format`; otherwise no persistent lines are left in it. A vhost file is only rewritten when its content changes. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
+
+With `json_logging`, each Nginx line is a JSON object instead (see the table above). Parsers that read both formats can tell them apart by the first character (`{`).
 
 When `persistent_php_logs` is enabled, PHP logs are written to `/var/log/webservertune-enhance/sites/<UUID>/php.log` - php-error.log for both webservers and php-fpm.log for Nginx. The sources inside the webspace are opened without following symlinks.
 

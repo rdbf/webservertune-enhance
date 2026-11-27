@@ -1197,6 +1197,88 @@ class NginxtuneMigrationTests(unittest.TestCase):
         self.assertFalse(Path(f"/var/www/{UUID}").exists())
 
 
+class NginxtuneJsonLoggingTests(unittest.TestCase):
+    """json_logging: one JSON object per request, switched in place, never doubled."""
+
+    KEYS = ["time", "msec", "ip", "peer", "cf_ray", "country", "host", "method", "uri",
+            "protocol", "status", "bytes_sent", "body_bytes", "request_bytes", "referer",
+            "ua", "cache", "request_time", "upstream_time"]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        ngx_env(self.tmp)
+        ngx.SITES_DIR = self.tmp / "sites-enabled"
+        ngx.SITES_DIR.mkdir()
+        ngx.SITE_LOGS_DIR = self.tmp / "logs"
+        self.conf = ngx.SITES_DIR / "example.com.conf"
+        self.conf.write_text(VHOST)
+
+    def cfg(self, pers=True, json_on=True, realip=False):
+        return {"general": {"persistent_logging": pers},
+                "nginx": {"features": {"json_logging": json_on, "real_ip_logging": realip}}}
+
+    def settle(self, cfg):
+        ngx.apply_logging_features(cfg, LOG)
+        before = self.conf.read_text()
+        self.assertFalse(ngx.apply_logging_features(cfg, LOG), "second pass changed the file")
+        self.assertEqual(self.conf.read_text(), before)
+        return before
+
+    def pers_fmts(self, text):
+        return [d for d in nc.parse(text) if d.name == "log_format" and d.args[0].endswith("_persistent")]
+
+    def body(self, d):
+        """The format string with every variable replaced, parsed as JSON."""
+        import json, re
+        self.assertEqual(d.args[1], "escape=json")
+        return json.loads(re.sub(r"\$[a-z_0-9]+", "x", d.args[2]))
+
+    def test_enabled_writes_one_json_format_and_log(self):
+        text = self.settle(self.cfg())
+        fmts = self.pers_fmts(text)
+        self.assertEqual(len(fmts), 1)
+        self.assertEqual(list(self.body(fmts[0])), self.KEYS)
+        self.assertIn('"ip":"$remote_addr"', fmts[0].args[2])
+        self.assertEqual(text.count(f"access_log {ngx.SITE_LOGS_DIR}/{UUID}/webserver.log "
+                                    "example.com_persistent;"), 1)
+        self.assertNotIn("access_log /var/www/", text)
+        # the Enhance log and its format are untouched
+        self.assertIn(f"access_log /var/local/enhance/webserver_logs/{UUID}.log example.com;", text)
+        self.assertIn('log_format example.com "\\"$remote_addr\\" \\"$msec\\"";', text)
+
+    def test_switch_text_json_text_in_place(self):
+        text_fmt = self.settle(self.cfg(json_on=False))
+        self.assertEqual(len(self.pers_fmts(text_fmt)), 1)
+        self.assertNotIn("escape=json", text_fmt)
+        as_json = self.settle(self.cfg(json_on=True))
+        self.assertEqual(len(self.pers_fmts(as_json)), 1)
+        self.assertIn("escape=json", as_json)
+        self.assertEqual(as_json.count("_persistent;"), 1)
+        back = self.settle(self.cfg(json_on=False))
+        self.assertEqual(back, text_fmt)
+
+    def test_real_ip_uses_actual_addr(self):
+        text = self.settle(self.cfg(realip=True))
+        fmt = self.pers_fmts(text)[0].args[2]
+        self.assertIn('"ip":"$actual_addr"', fmt)
+        self.assertIn('"peer":"$realip_remote_addr"', fmt)
+
+    def test_disabling_persistent_removes_json_lines(self):
+        self.settle(self.cfg())
+        text = self.settle(self.cfg(pers=False))
+        self.assertEqual(self.pers_fmts(text), [])
+        self.assertNotIn("webserver.log", text)
+
+    def test_preflight_accepts_json_vhost(self):
+        self.settle(self.cfg())
+        (self.tmp / "vhost_includes").mkdir(exist_ok=True)
+        (self.tmp / "vhost_includes" / "example.com.conf").write_text("")
+        nginx_conf = self.tmp / "nginx.conf"
+        nginx_conf.write_text(f"http {{ include {ngx.SITES_DIR}/*; }}\n")
+        problems, errors = nc.webspace_log_check(str(nginx_conf), prefix=str(self.tmp))
+        self.assertEqual((problems, errors), ([], []))
+
+
 class NginxtuneRunPreflightTests(unittest.TestCase):
     """run() must not call nginx -t (which opens every log as root) when any
     log destination in the include graph points into a webspace."""

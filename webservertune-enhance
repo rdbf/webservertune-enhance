@@ -158,6 +158,11 @@ def main():
             nginxtune    = load_module("nginxtune")
             nginx_logger = setup_logger("nginxtune", log_level)
             nginxtune.cleanup(nginx_logger)
+            # starting nginx opens every log file as root: never with a log
+            # destination that reaches into a webspace
+            if not nginxtune.log_preflight_ok(nginx_logger, "starting nginx"):
+                logger.error("nginx not started: a log destination reaches into a webspace. Exiting.")
+                sys.exit(1)
             subprocess.run(["systemctl", "start", "nginx"], capture_output=True)
             if not is_active("nginx"):
                 logger.error("nginx did not start after cleanup. Exiting.")

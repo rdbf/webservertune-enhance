@@ -19,8 +19,8 @@ Future Enhance updates might break functionality, although checks are in place t
 - Targeted processing — only modifies files when changes are actually needed
 - Webserver transition detection — monitors for switches between Nginx and OLS and reloads automatically
 - Automatic timestamped backups before any change, with rollback on failure
-- Persistent logging: Per-site webserver access logs written to `/var/www/<UUID>/logs/webserver.log`, for both Nginx and OLS
-- PHP log persistence: Per-site PHP error logs written to `/var/www/<UUID>/logs/php.log`, for both Nginx and OLS
+- Persistent logging: Per-site webserver access logs written to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log` (Nginx; OLS still uses the old location, see Security notes)
+- PHP log persistence: Per-site PHP error logs written to `/var/log/webservertune-enhance/sites/<UUID>/php.log` (Nginx; OLS still uses the old location, see Security notes)
 - Cloudflare API health: Monitors all CF-managed domains cluster-wide for zones stuck in `Error` state and automatically re-applies the existing token via the Enhance API. Checks all websites across all servers in the cluster — only needs to run on one server.
 
 ### Nginx
@@ -46,7 +46,7 @@ Future Enhance updates might break functionality, although checks are in place t
 - Root access
 - Enhance hosting environment
 - Python 3.11+ (default on Ubuntu 24.04)
-- Dependencies: `apt install inotify-tools python3-httpx python3-h2`
+- Dependencies: `apt install inotify-tools python3-httpx python3-h2 acl` (`acl` provides `setfacl`, needed for Nginx persistent logging)
 - Enhance installed updated Nginx (1.30.2) or OpenLiteSpeed (1.9.3)
 
 ## Installation
@@ -117,8 +117,8 @@ All settings are controlled through `settings.conf` in TOML format. All features
 |---------|---------|-------------|
 | `log_level` | `INFO` | `DEBUG` (everything), `INFO` (normal operations), `WARNING` (errors only) |
 | `debounce_seconds` | `10` | Seconds to wait after a file change before acting, to avoid reacting to partial writes - increase for servers with more sites |
-| `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/www/<UUID>/logs/webserver.log`. Applies to both Nginx and OLS. |
-| `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/www/<UUID>/logs/php.log`. Applies to both Nginx and OLS. |
+| `persistent_logging` | `false` | Per-site webserver access log persistence to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log` (root:adm, 0750). Nginx only for now; do not enable on OLS (see Security notes). |
+| `persistent_php_logs` | `false` | Per-site PHP error log persistence to `/var/log/webservertune-enhance/sites/<UUID>/php.log`. Nginx only for now; do not enable on OLS (see Security notes). |
 | `nginx_restart_manage` | `false` | Manages the nginx systemd service restart configuration |
 | `nginx_redirects` | `false` | Sync Enhance UI redirect rules to Nginx include files, per domain |
 | `ols_503fix_enable` | `false` | Load and start the OLS 503 fix module |
@@ -208,9 +208,9 @@ Each component writes to its own log file in `/var/log/webservertune-enhance/`:
 
 ### Persistent Logging
 
-When `persistent_logging` is enabled, access logs are written to `/var/www/<UUID>/logs/webserver.log`. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
+When `persistent_logging` is enabled, access logs are written to `/var/log/webservertune-enhance/sites/<UUID>/webserver.log`, a root-owned directory (root:adm, 0750) outside the webspace. The Nginx worker user (from the `user` directive, default `www-data`) gets search-only access through an ACL (`u:www-data:x`), because workers reopen log files themselves on `SIGUSR1`. Any `access_log` pointing below `/var/www/` is removed from the vhosts; with persistent logging enabled it is replaced by the new location. Persistent logging is only added to a vhost that has the Enhance access log with a valid webspace UUID and a `log_format`; otherwise no persistent lines are left in it. A vhost file is only rewritten when its content changes. For Nginx, an extended log format is used and when `real_ip_logging` is enabled, Cloudflare visitor IPs are logged instead of edge server IPs. For OLS, entries are tailed from `/var/local/enhance/webserver_logs/<UUID>.log`.
 
-When `persistent_php_logs` is enabled, PHP logs are written to `/var/www/<UUID>/logs/php.log` - php-error.log for both webservers and php-fpm.log for Nginx.
+When `persistent_php_logs` is enabled, PHP logs are written to `/var/log/webservertune-enhance/sites/<UUID>/php.log` - php-error.log for both webservers and php-fpm.log for Nginx. The sources inside the webspace are opened without following symlinks.
 
 ### Log Rotation
 
@@ -218,10 +218,8 @@ If log rotation is desired, create `/etc/logrotate.d/webservertune-enhance` with
 
 ```
 /var/log/webservertune-enhance/*.log
-/var/www/*/logs/webserver.log
-/var/www/*/logs/php.log
-/var/log/nginx/error.log
-/var/log/nginx/access.log
+/var/log/webservertune-enhance/sites/*/webserver.log
+/var/log/webservertune-enhance/sites/*/php.log
 {
    rotate 15
    weekly
@@ -232,7 +230,7 @@ If log rotation is desired, create `/etc/logrotate.d/webservertune-enhance` with
    copytruncate
 }
 ```
-Adjust settings as required, as this config saves 15 weekly logs.
+Adjust settings as required, as this config saves 15 weekly logs. `/var/log/nginx/*.log` is left out because Ubuntu's own `/etc/logrotate.d/nginx` already rotates it (listing a file twice makes logrotate fail).
 
 ## Bugs, feature requests, fixes
 
@@ -243,6 +241,12 @@ Adjust settings as required, as this config saves 15 weekly logs.
 - The Nginx version that Enhance ships is built against an old OpenSSL version (v3.0.13 - 30 Jan 2024), meaning that quic/http3 performance will be poor at best.
 - The CMS overrides can cause issues with the Enhance file manager when applied on the control panel, or block certain functionalities of your CMS.
 - Slugs with queries ( ? ) cannot be handled by Nginx for redirection, they will not be applied, but only logged.
+
+## Security notes
+
+- **Root no longer follows symlinks in tenant webspaces.** `fastcgiclear` reads, writes and re-owns `clear.cache` and the mu-plugin only through `O_NOFOLLOW` directory/file descriptors and checks each file with `fstat` (regular file, one hard link). Ownership is handed to the site user only for a file or `mu-plugins` directory the service has just created; an existing entry must already belong to the site user, so a root- or other-owned file placed in the webspace is refused, never re-owned. The WordPress search is iterative and bounded (depth 6, 20000 directories, 50 installs per webspace), and FastCGI cache clearing only empties real directories directly below `/var/nginx_cache`, taken from the vhosts whose Enhance access log names the webspace (at most one `fastcgi_cache_path` each; none when caching is off for it). A hash directory nginx writes into during the clear is removed again at once, and the whole clear is retried up to three times; `clear.cache` is reset to `cache=cleared` only after a complete clear, otherwise it stays `cache=stale` and an error is logged. `mu-plugins` is created by a short-lived process running as the site user, so the service never re-owns a directory. Nginx persistent and PHP logs moved out of `/var/www/<UUID>/logs/` (which the site user can write, and where the nginx master opened files as root) into `/var/log/webservertune-enhance/sites/<UUID>/`. Nginx configuration is read with `modules/nginxconf`, a small tokenizer that follows nginx's own rules (quotes and `#` only at token start, escapes, `${var}`), so comments and argument text are never mistaken for directives. Before `nginx -t` (which opens every log file as root) the service follows the whole include graph and refuses to test or reload if any `access_log`/`error_log` resolves into `/var/www` (following every symlink hop) or if an `access_log` destination contains a variable, which cannot be judged in advance; `python3 modules/nginxconf` runs the same check by hand. Regression tests: `python3 -m unittest discover -s tests -v` (run them as root too).
+- **Redirect rules are validated.** `nginxredirects` only writes a rule to the Nginx include when the source pattern, the target and the domain match a strict whitelist and the code is one of 301, 302, 303, 307, 308; any other rule is skipped and logged. Before `nginx -t`, the same webspace log check runs.
+- **Not yet fixed — do not enable persistent logging on OpenLiteSpeed:** `olstune` (persistent/PHP log copies and `_ensure_log_dir` inside `/var/www/<UUID>/logs/`) and `olsredirects` (writes `.htaccess` in the docroot as root) still follow symlinks the same way.
 
 ## Version History
 

@@ -27,6 +27,109 @@ UUID_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Rule translation
+# ---------------------------------------------------------------------------
+#
+# The rules come from the site's own .htaccess (parsed by Enhance), so every
+# piece the tenant controls is checked against a strict whitelist before it is
+# written into nginx configuration that is included in the site's server block
+# and loaded by root. Anything else -- whitespace, ';', braces, quotes, '#',
+# backslashes in the target -- could close the location and inject directives
+# (fastcgi_pass to another site's PHP-FPM socket, alias, access_log ...), so
+# such a rule is skipped, never escaped.
+
+REDIRECT_CODES = {"301", "302", "303", "307", "308"}
+# a URI regex: no whitespace, ';', '{', '}', '#', quotes
+_PATTERN_RE = re.compile(r"[A-Za-z0-9._~/%^$*+?()\[\]|\\:@!&=,-]+")
+# a redirect target URL (may use $1 / $request_uri): no whitespace, ';', braces,
+# quotes, '#', backslash
+_TARGET_RE  = re.compile(r"[A-Za-z0-9._~/%:?@!$&()*+,=\[\]-]+")
+_DOMAIN_RE  = re.compile(r"[A-Za-z0-9.-]+")
+
+
+def _extract_domain(cond_pattern):
+    """Strip ^(www.)? prefix and $ suffix from a host condPattern to get the bare domain."""
+    domain = re.sub(r'^\^\(www\.\)\?', '', cond_pattern)
+    domain = re.sub(r'\$$', '', domain)
+    return domain.strip()
+
+
+def translate_rules(items, logger):
+    """
+    Translate RewriteChain items to nginx return directives.
+    Returns dict of domain -> list of rule strings.
+    Rules with query string conditions are skipped -- nginx has no equivalent --
+    and so is every rule whose pattern, target or status code is not plainly
+    safe to place in nginx configuration.
+    """
+    rules_by_domain = {}
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        conds = item.get("conds", []) or []
+        rule  = item.get("rule", {}) or {}
+
+        host_conds = [c for c in conds if isinstance(c, dict) and c.get("testString") == "%{HTTP_HOST}"]
+        uri_cond   = next((c for c in conds if isinstance(c, dict)
+                           and c.get("testString") == "%{REQUEST_URI}"), None)
+
+        if not host_conds:
+            logger.warning(f"Skipping rule with missing host condition: {item!r:.200}")
+            continue
+
+        flags = rule.get("flags", []) or []
+        code  = next((str(f).split("=", 1)[1] for f in flags if str(f).startswith("R=")), "301")
+        if code not in REDIRECT_CODES:
+            logger.warning(f"Skipping rule with unsupported redirect code {code!r:.40}")
+            continue
+
+        substitution = str(rule.get("substitution", ""))
+        if uri_cond:
+            pattern = str(uri_cond.get("condPattern", ""))
+
+            if "?" in pattern:
+                logger.warning(
+                    f"Skipping '{pattern:.100}' -- "
+                    f"query string conditions are not supported in Nginx"
+                )
+                continue
+            if not _PATTERN_RE.fullmatch(pattern):
+                logger.warning(f"Skipping rule with unsafe URI pattern {pattern!r:.100}")
+                continue
+            target = substitution.replace("%{REQUEST_URI}", "$1")
+            loc = f"location ~ ^{pattern}(.*)$ {{"
+        else:
+            target = substitution.replace("%{REQUEST_URI}", "$request_uri")
+            loc = "location ~ ^(?!/.well-known)(.*)$ {"
+        if not _TARGET_RE.fullmatch(target):
+            logger.warning(f"Skipping rule with unsafe redirect target {target!r:.100}")
+            continue
+        rule_str = f"{loc}\n    return {code} {target};\n}}"
+
+        for host_cond in host_conds:
+            domain = _extract_domain(str(host_cond.get("condPattern", "")))
+            if not _DOMAIN_RE.fullmatch(domain):
+                # cannot match a vhost name anyway (those are plain domains)
+                logger.debug(f"Skipping rule for host pattern {domain!r:.100}")
+                continue
+            rules_by_domain.setdefault(domain, []).append(rule_str)
+
+    return rules_by_domain
+
+
+def _nginxconf():
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    path   = Path(__file__).resolve().parent / "nginxconf"
+    loader = SourceFileLoader("nginxconf", str(path))
+    spec   = importlib.util.spec_from_loader("nginxconf", loader)
+    mod    = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -56,65 +159,8 @@ def watch(config, logger, api_client):
     # Rule translation
     # ---------------------------------------------------------------------------
 
-    def _extract_domain(cond_pattern):
-        """Strip ^(www.)? prefix and $ suffix from a host condPattern to get the bare domain."""
-        domain = re.sub(r'^\^\(www\.\)\?', '', cond_pattern)
-        domain = re.sub(r'\$$', '', domain)
-        return domain.strip()
-
     def _translate_rules(items):
-        """
-        Translate RewriteChain items to nginx return directives.
-        Returns dict of domain -> list of rule strings.
-        Rules with query string conditions are skipped — nginx has no equivalent.
-        """
-        rules_by_domain = {}
-
-        for item in items:
-            conds = item.get("conds", [])
-            rule  = item.get("rule", {})
-
-            host_conds = [c for c in conds if c.get("testString") == "%{HTTP_HOST}"]
-            uri_cond   = next((c for c in conds if c.get("testString") == "%{REQUEST_URI}"), None)
-
-            if not host_conds:
-                logger.warning(f"Skipping rule with missing host condition: {item}")
-                continue
-
-            flags = rule.get("flags", [])
-            code  = next((f.split("=")[1] for f in flags if f.startswith("R=")), "301")
-
-            if uri_cond:
-                pattern = uri_cond["condPattern"]
-
-                if "?" in pattern:
-                    logger.warning(
-                        f"Skipping '{pattern}' — "
-                        f"query string conditions are not supported in Nginx"
-                    )
-                    continue
-
-                target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$1")
-                rule_str = (
-                    f"location ~ ^{pattern}(.*)$ {{\n"
-                    f"    return {code} {target};\n"
-                    f"}}"
-                )
-            else:
-                target = rule.get("substitution", "").replace("%{REQUEST_URI}", "$request_uri")
-                rule_str = (
-                    f"location ~ ^(?!/.well-known)(.*)$ {{\n"
-                    f"    return {code} {target};\n"
-                    f"}}"
-                )
-
-            for host_cond in host_conds:
-                domain = _extract_domain(host_cond["condPattern"])
-                if domain not in rules_by_domain:
-                    rules_by_domain[domain] = []
-                rules_by_domain[domain].append(rule_str)
-
-        return rules_by_domain
+        return translate_rules(items, logger)
 
 
     # ---------------------------------------------------------------------------
@@ -141,6 +187,15 @@ def watch(config, logger, api_client):
 
     def _reload_nginx():
         """Test nginx config and reload if valid. Logs and skips reload if test fails."""
+        # nginx -t opens every log file as root: same log destination check as nginxtune
+        try:
+            problems, errors = _nginxconf().webspace_log_check("/etc/nginx/nginx.conf")
+        except Exception as e:
+            problems, errors = [], [f"preflight failed: {e}"]
+        if problems or errors:
+            logger.error("nginx not tested or reloaded, log destination check failed: "
+                         + "; ".join((problems + errors)[:5]))
+            return
         try:
             test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
             if test.returncode != 0:

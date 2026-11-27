@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+nginxconf
+Minimal nginx configuration reader shared by nginxtune and fastcgiclear.
+
+It tokenizes like nginx's ngx_conf_read_token: whitespace separates tokens,
+quotes and '#' only start a string or comment at the start of a token,
+backslash escapes the next character, ';' ends a directive, '{' opens a
+block and '}' closes one, and "${" inside a token is a variable, not a block.
+Nothing here runs nginx: `nginx -t` already opens every log file as root,
+so checks on log destinations must happen before it.
+"""
+
+import fnmatch
+import glob
+import os
+import re
+import stat
+from collections import namedtuple
+
+NGINX_PREFIX = "/etc/nginx"      # nginx -V --prefix on Enhance servers
+WWW_DIR      = "/var/www"
+
+# name: directive name; args: decoded arguments; start/end: character offsets
+# of the whole directive including its terminator; line_start/line_end:
+# 0-based line numbers; term: ";" or "{"; depth: block nesting level;
+# ctx: names of the enclosing blocks, outermost first
+Directive = namedtuple("Directive", "name args start end line_start line_end term depth ctx")
+
+# blocks whose rows are data (map entries, mime types ...), not directives
+DATA_BLOCKS = {"map", "geo", "split_clients", "types", "charset_map", "match"}
+
+
+class ConfError(Exception):
+    """The text is not something nginx would accept (or not something we parse)."""
+
+
+_ESCAPES = {'"': '"', "'": "'", "\\": "\\", "t": "\t", "r": "\r", "n": "\n"}
+
+
+def _unescape(raw):
+    out, i = [], 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw) and raw[i + 1] in _ESCAPES:
+            out.append(_ESCAPES[raw[i + 1]])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def parse(text):
+    """Return every directive in text, in order. Raises ConfError on input nginx
+    would reject: unbalanced quotes or braces, ';' or '{' without a name, or a
+    directive left open at the end."""
+    directives = []
+    args, d_start, d_line = [], None, 0
+    stack = []
+    line, i, n = 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if ch in " \t\r":
+            i += 1
+            continue
+        if ch == "#":                              # comment at token start
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if ch in ";{":
+            if not args:
+                raise ConfError(f"line {line + 1}: unexpected '{ch}'")
+            directives.append(Directive(args[0], args[1:], d_start, i + 1, d_line, line, ch,
+                                        len(stack), tuple(stack)))
+            if ch == "{":
+                stack.append(args[0])
+            args, d_start = [], None
+            i += 1
+            continue
+        if ch == "}":
+            if args:
+                raise ConfError(f"line {line + 1}: unexpected '}}'")
+            if not stack:
+                raise ConfError(f"line {line + 1}: unexpected '}}'")
+            stack.pop()
+            i += 1
+            continue
+        # a token starts here
+        if d_start is None:
+            d_start, d_line = i, line
+        if ch in "\"'":
+            q, j, raw = ch, i + 1, []
+            while True:
+                if j >= n:
+                    raise ConfError(f"line {line + 1}: unterminated quoted string")
+                c = text[j]
+                if c == "\\" and j + 1 < n:
+                    raw.append(text[j:j + 2])
+                    if text[j + 1] == "\n":
+                        line += 1
+                    j += 2
+                    continue
+                if c == q:
+                    break
+                if c == "\n":
+                    line += 1
+                raw.append(c)
+                j += 1
+            args.append(_unescape("".join(raw)))
+            i = j + 1
+            # like nginx: after a quoted string only whitespace, ';', '{' or ')'
+            # (as in `if ($a = "x")`) may follow
+            if i < n and text[i] not in " \t\r\n;{)":
+                raise ConfError(f"line {line + 1}: unexpected character after quoted string")
+            continue
+        # an unquoted token ends at whitespace, ';' or '{' -- not at '}', which
+        # nginx treats as structural only at the start of a token; a '{'
+        # directly after '$' (as in ${var}) does not open a block
+        j, raw = i, []
+        while j < n:
+            c = text[j]
+            if c == "\\" and j + 1 < n:
+                raw.append(text[j:j + 2])
+                if text[j + 1] == "\n":
+                    line += 1
+                j += 2
+                continue
+            if c == "{" and raw and raw[-1] == "$":
+                raw.append(c)
+                j += 1
+                continue
+            if c in " \t\r\n;{":
+                break
+            raw.append(c)
+            j += 1
+        args.append(_unescape("".join(raw)))
+        i = j
+    if args or stack:
+        raise ConfError("unexpected end of file")
+    return directives
+
+
+def _resolve(path, base):
+    """Join like nginx does, without normalising: '..' after a symlink must mean
+    what the kernel makes of it."""
+    return path if path.startswith("/") else os.path.join(base, path)
+
+
+def _in_www(p):
+    for w in {WWW_DIR, os.path.realpath(WWW_DIR)}:
+        if p == w or p.startswith(w.rstrip("/") + "/"):
+            return True
+    return False
+
+
+MAX_SYMLINK_HOPS = 40
+
+
+def _reaches_www(path):
+    """True if resolving path the way the kernel does passes through /var/www at
+    any point: a component, any symlink hop (even one that later leads back
+    out), or the final target. The nginx master opens log files as root, so a
+    webspace anywhere on the way lets the site user redirect the open."""
+    return _walk(path)[0]
+
+
+def _walk(path):
+    """(reaches_www, resolved): resolve path hop by hop like the kernel; the
+    part that does not exist is kept literally. resolved always starts with a
+    single '/'."""
+    if _in_www(os.path.normpath(path)):
+        return True, os.path.normpath(path)
+    parts, cur, hops = [p for p in path.split("/") if p], "/", 0
+    while parts:
+        comp = parts.pop(0)
+        if comp == ".":
+            continue
+        if comp == "..":
+            cur = os.path.dirname(cur) or "/"
+            if _in_www(cur):
+                return True, cur
+            continue
+        nxt = os.path.join(cur, comp)
+        if _in_www(nxt):
+            return True, nxt
+        try:
+            st = os.lstat(nxt)
+        except FileNotFoundError:
+            cur = nxt                      # does not exist (yet): the rest is literal
+            continue
+        except OSError:
+            return True, cur               # cannot inspect: refuse
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > MAX_SYMLINK_HOPS:
+                return True, cur           # cannot judge: refuse
+            try:
+                target = os.readlink(nxt)
+            except OSError:
+                return True, cur
+            if _in_www(os.path.normpath(target if target.startswith("/") else os.path.join(cur, target))):
+                return True, cur
+            if target.startswith("/"):
+                cur = "/"
+            parts = [p for p in target.split("/") if p] + parts
+            continue
+        cur = nxt
+    return _in_www(cur), cur
+
+
+def read_config_file(path):
+    """Text of a config file. Opened without blocking and must be a regular file,
+    so a FIFO or device at an include path cannot stall or feed the reader."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ConfError("not a regular file")
+        with os.fdopen(fd, encoding="utf-8", errors="surrogateescape") as fh:
+            fd = None
+            return fh.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+# one loaded occurrence of a config file: base is the effective context of
+# the include that loaded it (() for the main file); directives carry
+# base + their own blocks as ctx
+# chain: realpaths of the files that included it, outermost first
+GraphFile = namedtuple("GraphFile", "file text directives base chain")
+
+MAX_INCLUDE_OCCURRENCES = 10000
+_UNSUPPORTED_GLOB = set("\\[]{}?")
+
+
+def _expand_include(pat):
+    """Files an include pattern loads, or raise ConfError. Only '*' wildcards in
+    the last path component are supported: escapes, '?' and character classes
+    may match differently from nginx's libc glob (locale, bytes). The directory
+    is listed exactly once; one that does not exist matches nothing, as in
+    nginx, one that cannot be listed is an error rather than "no match"."""
+    if not glob.has_magic(pat):
+        if not os.path.lexists(pat):
+            raise ConfError(f"include {pat} does not exist")
+        return [pat]
+    if _UNSUPPORTED_GLOB & set(pat) or any(ord(c) > 127 for c in pat):
+        # non-ASCII bytes may match differently in libc's locale-dependent glob
+        raise ConfError(f"unsupported include pattern {pat!r}")
+    d, name_pat = os.path.split(pat)
+    d = d or "."
+    if glob.has_magic(d):
+        raise ConfError(f"unsupported include pattern {pat}")
+    try:
+        names = os.listdir(d)
+    except (FileNotFoundError, NotADirectoryError):
+        return []               # like nginx (glob(3) GLOB_NOMATCH): nothing to load
+    except OSError as e:
+        raise ConfError(f"include {pat}: {e}")
+    # glob(3): '*' does not match a leading '.'
+    hits = [n for n in names if fnmatch.fnmatchcase(n, name_pat)
+            and (not n.startswith(".") or name_pat.startswith("."))]
+    return [os.path.join(d, n) for n in sorted(hits)]
+
+
+def include_graph(root, prefix=NGINX_PREFIX, conf_base=None):
+    """Return ([GraphFile], errors) for root and every file it includes,
+    recursively. A file included from several places appears once per place,
+    with that place's context; an include cycle is an error. Relative includes
+    resolve against conf_base, by default the directory of root (nginx's conf
+    prefix when root is the main config). Missing literal includes, include
+    directories that cannot be listed, unsupported patterns and unreadable,
+    non-regular or unparseable files are errors."""
+    if conf_base is None:
+        conf_base = os.path.dirname(os.path.abspath(root))
+    out, errors = [], []
+    stack = [(root, (), ())]
+    while stack:
+        f, base_ctx, chain = stack.pop()
+        if len(out) >= MAX_INCLUDE_OCCURRENCES:
+            errors.append(f"more than {MAX_INCLUDE_OCCURRENCES} included files")
+            break
+        real = os.path.realpath(f)
+        if real in chain:
+            errors.append(f"{f}: include cycle")
+            continue
+        try:
+            text = read_config_file(f)
+            ds = [d._replace(ctx=base_ctx + d.ctx, depth=len(base_ctx) + d.depth) for d in parse(text)]
+        except (OSError, ConfError) as e:
+            errors.append(f"{f}: {e}")
+            continue
+        out.append(GraphFile(f, text, ds, base_ctx, chain))
+        children = []
+        for d in ds:
+            if d.name != "include" or not d.args:
+                continue
+            try:
+                children.extend((g, d.ctx, chain + (real,))
+                                for g in _expand_include(_resolve(d.args[0], conf_base)))
+            except ConfError as e:
+                errors.append(f"{f}: {e}")
+        stack.extend(reversed(children))
+    return out, errors
+
+
+def is_webspace_log(d, prefix=NGINX_PREFIX):
+    """True if d is an access_log/error_log whose destination is /var/www or
+    below (directly, through a symlinked directory or file, or with '..'), or
+    cannot be judged because it contains a variable. Rows of data blocks
+    such as map are not directives and never count."""
+    if d.name not in ("access_log", "error_log") or not d.args or set(d.ctx) & DATA_BLOCKS:
+        return False
+    dest = d.args[0]
+    # special destinations differ per directive; anything else is a file path
+    # (e.g. `error_log off;` writes a file called "off")
+    if dest.startswith("syslog:"):
+        return False
+    if d.name == "access_log" and dest == "off":
+        return False
+    if d.name == "error_log" and (dest == "stderr" or dest.startswith("memory:")):
+        return False
+    if d.name == "error_log" or "$" not in dest:
+        # error_log never expands variables: nginx opens the literal path
+        return _reaches_www(_resolve(dest, prefix))
+    # a variable can expand to anything, '../' included: nginx workers open such
+    # paths at request time, and whether the result stays out of a webspace
+    # cannot be judged here (none of the servers uses them)
+    return True
+
+
+def split_lines(text):
+    """Lines (with their '\\n') exactly as parse() counts them: only '\\n' ends
+    a line, unlike str.splitlines(), which also splits on \\f, \\v, \\x85 ..."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def sole_on_line(text, directives):
+    """{line number: directive} for every directive that is complete on one line
+    and alone on it (only whitespace before it, only whitespace or a comment
+    after it). Lines holding several directives, a brace or part of a multi-line
+    directive are absent."""
+    starts = {}
+    for d in directives:
+        for ln in range(d.line_start, d.line_end + 1):
+            starts.setdefault(ln, []).append(d)
+    out = {}
+    for ln, ds in starts.items():
+        if len(ds) != 1:
+            continue
+        d = ds[0]
+        if d.line_start != d.line_end or d.term != ";":
+            continue
+        b = text.rfind("\n", 0, d.start) + 1
+        e = text.find("\n", d.end)
+        e = len(text) if e < 0 else e
+        after = text[d.end:e].strip()
+        if text[b:d.start].strip() == "" and (after == "" or after.startswith("#")):
+            out[ln] = d
+    return out
+
+
+def remove_directives(text, directives):
+    """Remove the given directives from text. A line left empty (or holding only
+    the removed directive) disappears entirely; anything else on the line stays."""
+    for d in sorted(directives, key=lambda d: d.start, reverse=True):
+        b = text.rfind("\n", 0, d.start) + 1
+        e = text.find("\n", d.end)
+        e = len(text) if e < 0 else e
+        if (text[b:d.start] + text[d.end:e]).strip() == "":
+            text = text[:b] + text[e + 1:]
+        else:
+            text = text[:d.start] + text[d.end:]
+    return text
+
+
+def log_destination_problems(directives, prefix=NGINX_PREFIX, where=""):
+    """access_log/error_log destinations that resolve to /var/www or below, or
+    that cannot be judged (an access_log path containing a variable)."""
+    bad = []
+    for d in directives:
+        if is_webspace_log(d, prefix):
+            bad.append(f"{where}line {d.line_start + 1}: {d.name} {d.args[0]}")
+    return bad
+
+
+def webspace_log_check(root, prefix=NGINX_PREFIX):
+    """(problems, errors) over the whole include graph of root. Both empty means
+    no access_log/error_log anywhere points into a webspace."""
+    files, errors = include_graph(root, prefix)
+    problems = []
+    for g in files:
+        problems += log_destination_problems(g.directives, prefix, where=f"{g.file}: ")
+    return problems, errors
+
+
+if __name__ == "__main__":
+    import sys
+    root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(NGINX_PREFIX, "nginx.conf")
+    files, errors = include_graph(root)
+    problems = []
+    for g in files:
+        problems += log_destination_problems(g.directives, where=f"{g.file}: ")
+    print(f"files={len(files)} webspace_logs={len(problems)} errors={len(errors)}")
+    for p in problems:
+        print("  BAD", p)
+    for e in errors:
+        print("  ERROR", e)
+    sys.exit(1 if problems or errors else 0)

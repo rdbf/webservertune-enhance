@@ -7,17 +7,23 @@ and clears FastCGI cache directly from the filesystem.
 Called by webservertune-enhance main program.
 """
 
+import collections
+import errno
 import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 WWW_DIR        = Path("/var/www")
 SITES_DIR      = Path("/etc/nginx/sites-enabled")
+NGINX_CONF     = Path("/etc/nginx/nginx.conf")
+NGINX_CONF_DIR = Path("/etc/nginx")    # nginx's conf prefix: base of relative includes
 FLAG_FILE      = "clear.cache"
 MU_PLUGIN_NAME = "fastcgiclear.php"
 MU_PLUGIN_SRC  = Path("/opt/webservertune-enhance/assets") / MU_PLUGIN_NAME
@@ -27,7 +33,633 @@ UUID_RE = re.compile(
     re.IGNORECASE
 )
 
-_CACHE_PATH_RE = re.compile(r'fastcgi_cache_path\s+(\S+)')
+
+
+# ---------------------------------------------------------------------------
+# Safe file operations inside tenant webspaces
+# ---------------------------------------------------------------------------
+#
+# This service runs as root, but /var/www/<uuid> and everything below it is
+# writable by the website's user (and by any PHP code running on the site).
+# Path-based os.chown / os.chmod / open / shutil.copy2 follow symlinks, so a
+# tenant could point clear.cache, mu-plugins or fastcgiclear.php at a host file
+# and have root overwrite it or hand it to the tenant.
+#
+# Every operation below therefore:
+#   - starts from a directory fd for /var/www/<uuid>. /var/www is root-owned,
+#     so the tenant cannot replace that entry itself;
+#   - opens each further path component relative to the previous fd with
+#     O_NOFOLLOW, so a symlinked component fails with ELOOP/ENOTDIR;
+#   - checks the opened file with fstat (regular file, single hard link)
+#     before writing, and changes ownership and mode only through the fd
+#     (fchown/fchmod);
+#   - gives ownership to the site user only for files/dirs it has just
+#     created itself. An existing entry must already belong to the site user:
+#     a root- or other-owned entry the tenant moved into place is refused,
+#     never re-owned.
+# A tenant who swaps components mid-operation can only make it fail.
+
+_DIR_FLAGS  = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_FILE_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+_FLAG_MAX   = 64
+
+# Bounds for the WordPress search, so one tenant cannot stall the service
+# with a huge or very deep tree.
+WALK_MAX_DEPTH = 6
+WALK_MAX_DIRS  = 20000
+WALK_MAX_ROOTS = 50
+WALK_MAX_ENTRIES = 500000   # directory entries examined in total
+
+# FastCGI cache directories are only ever deleted below this root-owned path.
+TRUSTED_CACHE_ROOT = Path("/var/nginx_cache")
+CLEAR_ATTEMPTS     = 3    # whole-site attempts (e.g. a vhost being regenerated)
+CLEAR_RETRY_SECS   = 1
+CLEAR_BUCKET_TRIES = 5    # immediate re-removals of a hash dir nginx wrote into
+
+
+class UnsafePath(Exception):
+    """A path inside a webspace is a symlink, not a regular file, or otherwise unsafe."""
+
+
+def www_dir_is_safe():
+    """True if WWW_DIR is a real directory owned by root and not writable by group/other.
+
+    The whole design relies on the tenant being unable to replace /var/www/<uuid>
+    itself, so refuse to operate if that assumption does not hold.
+    """
+    try:
+        st = os.lstat(WWW_DIR)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == 0
+            and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)))
+
+
+def open_webspace(uuid):
+    """Return an O_DIRECTORY fd for WWW_DIR/<uuid> (never follows a symlink)."""
+    if not UUID_RE.fullmatch(uuid or ""):
+        raise UnsafePath(f"invalid webspace name: {uuid!r}")
+    try:
+        return os.open(str(WWW_DIR / uuid), _DIR_FLAGS)
+    except OSError as e:
+        raise UnsafePath(f"cannot open webspace {uuid}: {e}") from e
+
+
+def open_subdir(base_fd, parts):
+    """Open a chain of subdirectories below base_fd without following symlinks.
+
+    Returns a new fd for the last component. The caller closes it.
+    """
+    fd = os.dup(base_fd)
+    try:
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part:
+                raise UnsafePath(f"bad path component: {part!r}")
+            try:
+                nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                raise UnsafePath(f"{part}: {e}") from e
+            os.close(fd)
+            fd = nfd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _check_regular(fd, name, allowed_uids):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise UnsafePath(f"{name}: not a regular file")
+    if st.st_nlink != 1:
+        raise UnsafePath(f"{name}: has {st.st_nlink} hard links")
+    if allowed_uids is not None and st.st_uid not in allowed_uids:
+        raise UnsafePath(f"{name}: owned by uid {st.st_uid}")
+    return st
+
+
+def read_small(dir_fd, name, limit=_FLAG_MAX):
+    """Read up to `limit` bytes of a regular file in dir_fd. Refuses symlinks, FIFOs, devices."""
+    try:
+        fd = os.open(name, os.O_RDONLY | _FILE_FLAGS, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return None
+        raise UnsafePath(f"{name}: {e}") from e
+    try:
+        _check_regular(fd, name, None)
+        return os.read(fd, limit).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def write_owned(dir_fd, name, data, uid, gid, mode=0o644):
+    """Create or replace the content of a regular file in dir_fd and give it to uid:gid.
+
+    Never follows a symlink, never writes to a FIFO/device or a multiply-linked file.
+    A new file is created exclusively (so it is ours); an existing file is only
+    rewritten if it already belongs to uid. Root- or other-owned files are refused.
+    """
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS, mode, dir_fd=dir_fd)
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(name, os.O_WRONLY | _FILE_FLAGS, dir_fd=dir_fd)
+        except OSError as e:
+            raise UnsafePath(f"{name}: {e}") from e
+        created = False
+    except OSError as e:
+        raise UnsafePath(f"{name}: {e}") from e
+    try:
+        _check_regular(fd, name, {os.geteuid()} if created else {uid})
+        os.ftruncate(fd, 0)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def webspace_owner(ws_fd):
+    """(uid, gid) of the webspace directory, read from its fd."""
+    st = os.fstat(ws_fd)
+    return st.st_uid, st.st_gid
+
+
+def ensure_flag_file(uuid):
+    """Create clear.cache if absent, owned by the webspace user. Returns True if handled."""
+    ws = open_webspace(uuid)
+    try:
+        uid, gid = webspace_owner(ws)
+        if uid == 0:
+            raise UnsafePath(f"webspace {uuid} is owned by root")
+        if read_small(ws, FLAG_FILE) is None:
+            write_owned(ws, FLAG_FILE, b"cache=cleared\n", uid, gid)
+            return True
+        # exists: it must already be the site user's file; only fix group/mode,
+        # through a checked fd. A root- or other-owned file is never handed over.
+        try:
+            fd = os.open(FLAG_FILE, os.O_RDONLY | _FILE_FLAGS, dir_fd=ws)
+        except OSError as e:
+            raise UnsafePath(f"{FLAG_FILE}: {e}") from e
+        try:
+            st = _check_regular(fd, FLAG_FILE, {uid})
+            if st.st_gid != gid:
+                os.fchown(fd, uid, gid)
+            if (st.st_mode & 0o7777) != 0o644:
+                os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+        return True
+    finally:
+        os.close(ws)
+
+
+def read_flag(uuid):
+    """Return the stripped content of clear.cache, or None if absent/unsafe."""
+    ws = open_webspace(uuid)
+    try:
+        content = read_small(ws, FLAG_FILE)
+        return content.strip() if content is not None else None
+    finally:
+        os.close(ws)
+
+
+def write_flag_cleared(uuid):
+    """Reset clear.cache to cache=cleared, owned by the webspace user."""
+    ws = open_webspace(uuid)
+    try:
+        uid, gid = webspace_owner(ws)
+        if uid == 0:
+            raise UnsafePath(f"webspace {uuid} is owned by root")
+        write_owned(ws, FLAG_FILE, b"cache=cleared\n", uid, gid)
+    finally:
+        os.close(ws)
+
+
+def find_wp_roots(ws_fd):
+    """Relative path parts of every WordPress root below the webspace fd.
+
+    Iterative and fd-based: every directory is opened relative to the webspace
+    with O_NOFOLLOW (re-walked from ws_fd, so no fds pile up), symlinked
+    directories are never entered, wp-content is not descended into, and the
+    search is bounded by WALK_MAX_DEPTH / WALK_MAX_DIRS / WALK_MAX_ROOTS.
+    Directories that vanish or cannot be read are skipped.
+
+    Returns (roots, note) where note explains an early stop, or None.
+    """
+    roots, note = [], None
+    # breadth-first, so shallow directories such as public_html are always
+    # searched before a huge tree deeper down can exhaust the limits
+    queue, visited, examined = collections.deque([[]]), 0, 0
+    while queue and note is None:
+        parts = queue.popleft()
+        visited += 1
+        if visited > WALK_MAX_DIRS:
+            note = f"stopped after {WALK_MAX_DIRS} directories"
+            break
+        try:
+            fd = open_subdir(ws_fd, parts)
+        except UnsafePath:
+            continue
+        dirs, has_config, has_content = [], False, False
+        try:
+            with os.scandir(fd) as it:
+                for e in it:
+                    examined += 1
+                    if examined > WALK_MAX_ENTRIES:
+                        note = f"stopped after {WALK_MAX_ENTRIES} directory entries"
+                        break
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name == "wp-content":
+                                has_content = True
+                            # only directories that will be descended into are kept
+                            elif len(parts) < WALK_MAX_DEPTH and len(dirs) < WALK_MAX_DIRS:
+                                dirs.append(e.name)
+                        elif e.name == "wp-config.php" and e.is_file(follow_symlinks=False):
+                            has_config = True
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+        if note is not None:
+            break
+        if has_config and has_content:
+            roots.append(parts)
+            if len(roots) >= WALK_MAX_ROOTS:
+                note = f"stopped after {WALK_MAX_ROOTS} WordPress roots"
+                break
+        if len(parts) < WALK_MAX_DEPTH:
+            for name in sorted(dirs):
+                if len(queue) >= WALK_MAX_DIRS:
+                    break
+                queue.append(parts + [name])
+    return roots, note
+
+
+_MKDIR_CHILD = (
+    "import os, sys\n"
+    "try:\n"
+    "    os.mkdir(sys.argv[2], 0o755, dir_fd=int(sys.argv[1]))\n"
+    "except FileExistsError:\n"
+    "    pass\n"
+)
+
+
+def _mkdir_as(dir_fd, name, uid):
+    """Create directory `name` inside the open directory dir_fd as the site user.
+
+    A child process with the site account's uid and primary gid (from the
+    passwd entry, never from the tenant-controlled directory) and no
+    supplementary groups calls mkdirat() on the inherited descriptor, so no
+    path is resolved again. Root never creates and then re-owns a directory,
+    so there is nothing to swap.
+    """
+    if "/" in name or name in ("", ".", ".."):
+        raise UnsafePath(f"bad directory name: {name!r}")
+    if uid == 0:
+        raise UnsafePath("refusing to act as root for a webspace")
+    if os.fstat(dir_fd).st_uid != uid:
+        raise UnsafePath("parent directory is not owned by the site user")
+    if os.geteuid() == 0:
+        try:
+            gid = pwd.getpwuid(uid).pw_gid
+        except KeyError:
+            raise UnsafePath(f"uid {uid} has no passwd entry")
+        creds = {"user": uid, "group": gid, "extra_groups": []}
+    elif os.geteuid() == uid:
+        creds = {}
+    else:
+        raise UnsafePath("cannot act as the site user")
+    try:
+        r = subprocess.run([sys.executable, "-I", "-S", "-c", _MKDIR_CHILD, str(dir_fd), name],
+                           pass_fds=(dir_fd,), cwd="/", env={"LC_ALL": "C"},
+                           stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=5, **creds)
+    except subprocess.TimeoutExpired:
+        # the child runs as the site user, who can stop it; never wait long
+        raise UnsafePath("mkdir as site user timed out")
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise UnsafePath(f"mkdir as site user failed: {err[-1] if err else r.returncode}")
+
+
+def _label(parts):
+    """Printable relative path for log messages (tenant file names may not be valid UTF-8)."""
+    return "/".join(parts).encode("utf-8", "backslashreplace").decode("ascii", "backslashreplace")
+
+
+def deploy_mu_plugin(uuid, plugin_bytes):
+    """Install plugin_bytes as wp-content/mu-plugins/fastcgiclear.php in every WordPress root.
+
+    Returns (results, note): a list of (relative_path, ok, message) and the
+    note from find_wp_roots (None unless the search stopped early).
+    """
+    results = []
+    ws = open_webspace(uuid)
+    try:
+        uid, gid = webspace_owner(ws)
+        if uid == 0:
+            raise UnsafePath(f"webspace {uuid} is owned by root")
+        roots, note = find_wp_roots(ws)
+        for parts in roots:
+            label = _label(parts + ["wp-content", "mu-plugins", MU_PLUGIN_NAME])
+            try:
+                wpc = open_subdir(ws, parts + ["wp-content"])
+                try:
+                    try:
+                        os.lstat("mu-plugins", dir_fd=wpc)
+                    except FileNotFoundError:
+                        _mkdir_as(wpc, "mu-plugins", uid)
+                    mu = open_subdir(wpc, ["mu-plugins"])
+                    try:
+                        # the directory must be the site user's own; it is never re-owned
+                        st = os.fstat(mu)
+                        if st.st_uid != uid:
+                            raise UnsafePath(f"mu-plugins owned by uid {st.st_uid}")
+                        write_owned(mu, MU_PLUGIN_NAME, plugin_bytes, uid, gid)
+                    finally:
+                        os.close(mu)
+                finally:
+                    os.close(wpc)
+                results.append((label, True, "deployed"))
+            except (UnsafePath, OSError) as e:
+                results.append((label, False, str(e)))
+    finally:
+        os.close(ws)
+    return results, note
+
+
+_nginxconf_mod = None
+
+
+def _nginxconf():
+    """The shared nginx config reader (modules/nginxconf), loaded once."""
+    global _nginxconf_mod
+    if _nginxconf_mod is None:
+        from importlib.machinery import SourceFileLoader
+        import importlib.util
+        path   = Path(__file__).resolve().parent / "nginxconf"
+        loader = SourceFileLoader("nginxconf", str(path))
+        spec   = importlib.util.spec_from_loader("nginxconf", loader)
+        mod    = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _nginxconf_mod = mod
+    return _nginxconf_mod
+
+
+def find_cache_paths(uuid):
+    """FastCGI cache directories of every vhost that serves the webspace.
+
+    nginx's effective configuration is read from nginx.conf through every
+    include (modules/nginxconf), so each directive has its real context. A vhost
+    belongs to the webspace when one of its server blocks, in a file directly in
+    sites-enabled, has the Enhance access_log of the webspace; its cache zone is
+    the vhost file's own http-level fastcgi_cache_path (at most one, none when
+    caching is off for it). A webspace can have several such vhosts (domains,
+    preview aliases).
+
+    Raises UnsafePath whenever the answer could be incomplete or ambiguous: any
+    file of the configuration cannot be read or parsed, no vhost names the
+    webspace, the webspace's log appears anywhere else (another context, an
+    included file), or a matched vhost has more than one zone or includes other
+    files at http level.
+    """
+    nc       = _nginxconf()
+    want_log = f"/var/local/enhance/webserver_logs/{uuid}.log"
+    if not SITES_DIR.is_dir():
+        raise UnsafePath(f"{SITES_DIR} is not a directory")
+    files, errors = nc.include_graph(str(NGINX_CONF), conf_base=str(NGINX_CONF_DIR))
+    if errors:
+        raise UnsafePath(f"nginx configuration cannot be read completely: {errors[0]}")
+    vhost_dir = os.path.realpath(SITES_DIR)
+
+    def is_vhost_file(f):
+        # by the directory it is listed in, not its target (sites-enabled
+        # entries may be symlinks into sites-available)
+        # realpath of the parent as written: abspath() would collapse '..'
+        # before symlinks are followed
+        return (os.path.realpath(os.path.dirname(f) or ".") == vhost_dir
+                and not os.path.basename(f).startswith("000-"))
+
+    def names_log(d):
+        return (d.name == "access_log" and d.args[:1] == [want_log]
+                and not set(d.ctx) & nc.DATA_BLOCKS)      # rows of map/geo/... are data
+
+    by_file, matched = {}, {}
+    for g in files:
+        for d in g.directives:
+            if not names_log(d):
+                continue
+            # only a vhost file loaded at http level, with the log directly in
+            # one of its own server blocks; anything else (nginx.conf's http
+            # block, a location, a fragment included into a server) is refused
+            local = d.ctx[len(g.base):]
+            if not (is_vhost_file(g.file) and g.base == ("http",) and local == ("server",)):
+                raise UnsafePath(f"{g.file} names the webspace log outside a vhost's own server block")
+            matched[g.file] = g.base
+            by_file[g.file] = g.directives
+    if not matched:
+        raise UnsafePath("no vhost names this webspace")
+    # a vhost file on disk that names the webspace but is not part of the loaded
+    # graph (e.g. an include edited but not reloaded yet) may still be served
+    # (its includes are followed too). Files nginx already loads as vhosts were
+    # checked above; dotfiles (editor swap/lock files, .git) and directories are
+    # never loaded by `include sites-enabled/*` and are skipped like glob(3) does.
+    loaded = {os.path.realpath(g.file) for g in files if g.base == ("http",) and is_vhost_file(g.file)}
+    for cf in sorted(SITES_DIR.iterdir()):
+        if cf.name.startswith(".") or os.path.realpath(cf) in loaded or not is_vhost_file(str(cf)):
+            continue
+        if cf.is_dir():
+            continue
+        pending, perrors = nc.include_graph(str(cf), conf_base=str(NGINX_CONF_DIR))
+        if perrors:
+            raise UnsafePath(f"{cf.name} cannot be read completely: {perrors[0]}")
+        if any(names_log(d) for g in pending for d in g.directives):
+            raise UnsafePath(f"{cf.name} names the webspace but is not loaded as a vhost")
+    # every fastcgi_cache reference in the loaded configuration, with the files
+    # it belongs to (its own and every file that included it)
+    uses = [({os.path.realpath(g.file), *g.chain}, g.file, d) for g in files for d in g.directives
+            if d.name == "fastcgi_cache" and d.args and not set(d.ctx) & nc.DATA_BLOCKS]
+    enhance_logs = [({os.path.realpath(g.file), *g.chain}, g.file, d) for g in files for d in g.directives
+                    if d.name == "access_log" and d.args
+                    and d.args[0].startswith("/var/local/enhance/webserver_logs/")]
+    paths = []
+    for f, base in matched.items():
+        ds = by_file[f]
+        # the vhost file sits at http level: cache zones are its http-level
+        # fastcgi_cache_path directives; an http-level include could declare more
+        if any(d.name == "include" and d.ctx == base for d in ds):
+            raise UnsafePath(f"{os.path.basename(f)} includes other files at http level")
+        decl = [d for d in ds if d.name == "fastcgi_cache_path" and d.args and d.ctx == base]
+        if len(decl) > 1:
+            raise UnsafePath(f"{os.path.basename(f)} has {len(decl)} fastcgi_cache_path directives")
+        zone = None
+        if decl:
+            zone = next((a.split("=", 1)[1].split(":", 1)[0] for a in decl[0].args[1:]
+                         if a.startswith("keys_zone=")), None)
+            if not zone:
+                raise UnsafePath(f"{os.path.basename(f)}: fastcgi_cache_path without keys_zone")
+        # the zone must belong to this vhost alone: used only from this file, and
+        # this file uses no other zone -- otherwise emptying it is someone else's
+        # purge too, or this site's cached pages live somewhere else
+        real_f = os.path.realpath(f)
+        # one vhost file per site: another webspace's log in it (or in a file it
+        # includes) means its zone may serve two sites
+        for owners, lf, d in enhance_logs:
+            if real_f in owners and d.args[0] != want_log:
+                raise UnsafePath(f"{os.path.basename(f)} also serves another webspace ({lf})")
+        for owners, uf, d in uses:
+            z = d.args[0]
+            if z == "off":
+                continue
+            if "$" in z:
+                raise UnsafePath(f"{uf}: fastcgi_cache with a variable zone")
+            same_file = real_f in owners
+            if d.ctx == ("http",) and not same_file:
+                # set at http level elsewhere: inherited by every server
+                raise UnsafePath(f"{uf}: fastcgi_cache {z} at http level applies to all sites")
+            if z == zone and not same_file:
+                raise UnsafePath(f"cache zone {z} of {os.path.basename(f)} is also used by {uf}")
+            if same_file and z != zone:
+                raise UnsafePath(f"{os.path.basename(f)} uses cache zone {z} declared elsewhere")
+        paths.extend(Path(d.args[0]) for d in decl)
+    return paths
+
+
+def _rmtree_errors(path):
+    """rmtree path without following links; returns [(errno, message)] for every
+    failure except entries that vanished (nginx's cache manager expiring them)."""
+    errors = []
+
+    def onexc(func, p, exc):
+        if isinstance(exc, FileNotFoundError):
+            return
+        errors.append((getattr(exc, "errno", None), f"{p}: {exc}"))
+
+    def onerror(func, p, info):
+        onexc(func, p, info[1])
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=onexc)
+        else:
+            shutil.rmtree(path, onerror=onerror)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        errors.append((e.errno, f"{path}: {e}"))
+    return errors
+
+
+def clear_cache_dir(cache_dir):
+    """Empty a trusted cache directory. Returns a list of errors.
+
+    nginx keeps working on the cache meanwhile. Entries its cache manager
+    expires disappear (ENOENT), which is fine. A response can also be cached
+    into a hash directory that was already emptied, so removing its parent
+    fails with ENOTEMPTY. That entry may predate the content change, so the
+    hash directory is removed again at once (it then holds only the few new
+    files); if it still fails, that is an error and the caller retries."""
+    errors = []
+    try:
+        with os.scandir(cache_dir) as it:
+            entries = list(it)
+    except OSError as e:
+        return [f"{cache_dir}: {e}"]
+    for entry in entries:
+        try:
+            is_dir = entry.is_dir(follow_symlinks=False)
+        except FileNotFoundError:
+            continue                    # expired meanwhile
+        except OSError as e:
+            errors.append(f"{entry.path}: {e}")
+            continue
+        if not is_dir:
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                errors.append(f"{entry.path}: {e}")
+            continue
+        for _ in range(CLEAR_BUCKET_TRIES):
+            errs = _rmtree_errors(entry.path)
+            # POSIX lets rmdir report a non-empty directory as EEXIST too
+            if not errs or any(code not in (errno.ENOTEMPTY, errno.EEXIST) for code, _ in errs):
+                break
+        errors.extend(msg for _, msg in errs)
+    return errors
+
+
+def clear_site_cache(uuid, logger):
+    """One attempt at emptying every cache dir of the webspace. True only if all
+    of them are known and were emptied completely (or do not exist yet). Every
+    attempt empties every directory: a path is not proof that it is still the
+    directory an earlier attempt emptied."""
+    try:
+        cache_paths = find_cache_paths(uuid)
+    except Exception as e:
+        logger.error(f"[{uuid}] Cannot determine cache paths: {e}")
+        return False
+    ok = True
+    for cache_dir in cache_paths:
+        if cache_dir.parent != TRUSTED_CACHE_ROOT or cache_dir.name in ("", ".", ".."):
+            logger.warning(f"[{uuid}] Not clearing {cache_dir}: not directly below "
+                           f"{TRUSTED_CACHE_ROOT}")
+            ok = False
+            continue
+        try:
+            os.lstat(cache_dir)
+        except FileNotFoundError:
+            continue            # nothing cached yet
+        except OSError as e:
+            logger.error(f"[{uuid}] Cannot check {cache_dir}: {e}")
+            ok = False
+            continue
+        if not cache_dir_is_trusted(cache_dir):
+            logger.warning(f"[{uuid}] Not clearing {cache_dir}: not a real directory "
+                           f"directly below {TRUSTED_CACHE_ROOT}")
+            ok = False
+            continue
+        errors = clear_cache_dir(cache_dir)
+        if errors:
+            ok = False
+            logger.warning(f"[{uuid}] Cache dir {cache_dir} only partly cleared "
+                           f"({len(errors)} errors, first: {errors[0]})")
+        else:
+            logger.info(f"[{uuid}] Cleared cache dir {cache_dir}")
+    return ok
+
+
+def _is_real_dir(path):
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def cache_dir_is_trusted(path):
+    """True if path is a real directory directly below TRUSTED_CACHE_ROOT, which is
+    root-owned and not writable by group/other. Only such directories are emptied."""
+    try:
+        p = Path(path)
+        if p.parent != TRUSTED_CACHE_ROOT or p.name in ("", ".", ".."):
+            return False
+        root_st = os.lstat(TRUSTED_CACHE_ROOT)
+        if (not stat.S_ISDIR(root_st.st_mode) or root_st.st_uid not in (0, os.geteuid())
+                or root_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            return False
+        return stat.S_ISDIR(os.lstat(p).st_mode)
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +669,11 @@ _CACHE_PATH_RE = re.compile(r'fastcgi_cache_path\s+(\S+)')
 def watch(config, logger):
     """Entry point called by main program."""
     logger.info("fastcgiclear starting")
+
+    if not www_dir_is_safe():
+        logger.error(f"{WWW_DIR} is not a root-owned directory without group/other write; "
+                     "refusing to manage webspaces")
+        return
 
     general       = config.get("general", {})
     debounce_secs = general.get("debounce_seconds", 10)
@@ -53,32 +690,12 @@ def watch(config, logger):
     # Helpers
     # ---------------------------------------------------------------------------
 
-    def _get_webspace_pw(uuid):
-        """Return pwd entry for the system user owning the webspace directory."""
-        try:
-            stat = os.stat(WWW_DIR / uuid)
-            return pwd.getpwuid(stat.st_uid)
-        except Exception:
-            return None
-
     def _ensure_flag_file(uuid):
         """Create the flag file if absent, and correct ownership/permissions if wrong."""
-        flag = WWW_DIR / uuid / FLAG_FILE
-        pw   = _get_webspace_pw(uuid)
-        if pw is None:
-            return
         try:
-            if not flag.exists():
-                flag.write_text("cache=cleared\n")
-                os.chown(flag, pw.pw_uid, pw.pw_gid)
-                os.chmod(flag, 0o644)
-                logger.debug(f"[{uuid}] Created {FLAG_FILE}")
-            else:
-                st = os.stat(flag)
-                if st.st_uid != pw.pw_uid or st.st_gid != pw.pw_gid:
-                    os.chown(flag, pw.pw_uid, pw.pw_gid)
-                if (st.st_mode & 0o777) != 0o644:
-                    os.chmod(flag, 0o644)
+            ensure_flag_file(uuid)
+        except UnsafePath as e:
+            logger.warning(f"[{uuid}] Refusing to touch {FLAG_FILE}: {e}")
         except Exception as e:
             logger.error(f"[{uuid}] Failed to ensure {FLAG_FILE}: {e}")
 
@@ -87,31 +704,26 @@ def watch(config, logger):
         Deploy the mu-plugin to every WordPress install found in the webspace.
         Skips wp-config.php files inside wp-content to avoid false matches.
         """
-        if not MU_PLUGIN_SRC.exists():
+        try:
+            plugin_bytes = MU_PLUGIN_SRC.read_bytes()
+        except OSError:
             logger.warning(f"mu-plugin source not found: {MU_PLUGIN_SRC}")
             return
-        pw = _get_webspace_pw(uuid)
-        if pw is None:
+        try:
+            results, note = deploy_mu_plugin(uuid, plugin_bytes)
+        except UnsafePath as e:
+            logger.warning(f"[{uuid}] Refusing to deploy mu-plugin: {e}")
             return
-        uuid_dir = WWW_DIR / uuid
-        for wp_config in uuid_dir.rglob("wp-config.php"):
-            if "wp-content" in wp_config.parts:
-                continue
-            wp_root = wp_config.parent
-            if not (wp_root / "wp-content").is_dir():
-                continue
-            mu_dir = wp_root / "wp-content" / "mu-plugins"
-            dest   = mu_dir / MU_PLUGIN_NAME
-            try:
-                mu_dir.mkdir(parents=True, exist_ok=True)
-                os.chown(mu_dir, pw.pw_uid, pw.pw_gid)
-                os.chmod(mu_dir, 0o755)
-                shutil.copy2(MU_PLUGIN_SRC, dest)
-                os.chown(dest, pw.pw_uid, pw.pw_gid)
-                os.chmod(dest, 0o644)
-                logger.info(f"[{uuid}] Deployed mu-plugin to {dest}")
-            except Exception as e:
-                logger.error(f"[{uuid}] Failed to deploy mu-plugin to {dest}: {e}")
+        except Exception as e:
+            logger.error(f"[{uuid}] Failed to deploy mu-plugin: {e}")
+            return
+        if note:
+            logger.warning(f"[{uuid}] WordPress search {note}; some installs may be missed")
+        for label, ok, msg in results:
+            if ok:
+                logger.info(f"[{uuid}] Deployed mu-plugin to {label}")
+            else:
+                logger.warning(f"[{uuid}] Refusing to deploy mu-plugin to {label}: {msg}")
 
     def _handle_uuid(uuid):
         """Register a new webspace UUID, set up its flag file, and deploy the mu-plugin."""
@@ -139,64 +751,26 @@ def watch(config, logger):
     # Cache clearing
     # ---------------------------------------------------------------------------
 
-    def _find_cache_paths(uuid):
-        """
-        Find all FastCGI cache directories for a UUID by scanning vhost configs.
-        A single webspace can have multiple domains, each with its own cache path.
-        Returns a list of cache directory Paths.
-        """
-        paths = []
-        try:
-            for cf in SITES_DIR.glob("*.conf"):
-                if cf.name.startswith("000-"):
-                    continue
-                content = cf.read_text()
-                if uuid not in content:
-                    continue
-                for line in content.splitlines():
-                    m = _CACHE_PATH_RE.match(line.strip())
-                    if m:
-                        paths.append(Path(m.group(1)))
-        except Exception as e:
-            logger.error(f"[{uuid}] Failed to find cache paths: {e}")
-        return paths
-
     def _do_clear(uuid):
-        """
-        Clear FastCGI cache for all domains in the webspace by removing
-        cached files directly from the filesystem, then reset the flag file.
-        """
+        """Clear the FastCGI cache of every domain of the webspace, then reset the
+        flag. Retried a few times because nginx keeps using the cache meanwhile;
+        the flag is only reset after a complete clear."""
         logger.info(f"[{uuid}] Clearing FastCGI cache")
-
-        cache_paths = _find_cache_paths(uuid)
-        if not cache_paths:
-            logger.debug(f"[{uuid}] No cache paths found, skipping")
+        for attempt in range(1, CLEAR_ATTEMPTS + 1):
+            if clear_site_cache(uuid, logger):
+                break
+            if attempt < CLEAR_ATTEMPTS:
+                time.sleep(CLEAR_RETRY_SECS)
+        else:
+            logger.error(f"[{uuid}] Cache not completely cleared after {CLEAR_ATTEMPTS} attempts; "
+                         f"leaving {FLAG_FILE} as cache=stale (retried on the next flag write "
+                         "or service restart)")
             return
-
-        for cache_dir in cache_paths:
-            if not cache_dir.is_dir():
-                continue
-            try:
-                for entry in cache_dir.iterdir():
-                    try:
-                        if entry.is_dir():
-                            shutil.rmtree(entry)
-                        else:
-                            entry.unlink()
-                    except Exception:
-                        pass
-                logger.info(f"[{uuid}] Cleared cache dir {cache_dir}")
-            except Exception as e:
-                logger.error(f"[{uuid}] Failed to clear cache dir {cache_dir}: {e}")
-
-        flag = WWW_DIR / uuid / FLAG_FILE
-        pw   = _get_webspace_pw(uuid)
         try:
-            flag.write_text("cache=cleared\n")
-            if pw:
-                os.chown(flag, pw.pw_uid, pw.pw_gid)
-            os.chmod(flag, 0o644)
+            write_flag_cleared(uuid)
             logger.debug(f"[{uuid}] Wrote cache=cleared")
+        except UnsafePath as e:
+            logger.warning(f"[{uuid}] Refusing to reset {FLAG_FILE}: {e}")
         except Exception as e:
             logger.error(f"[{uuid}] Failed to write cache=cleared: {e}")
 
@@ -222,8 +796,15 @@ def watch(config, logger):
         Restarts inotifywait whenever a new UUID is registered via _restart_flag_watcher().
         """
         while True:
+            # inotifywait exits at once if any path is missing, so a deleted
+            # webspace would stop cache clearing for every site: drop it here
+            # (it is registered again if the directory comes back).
             with uuid_lock:
+                gone  = {u for u in known_uuids if not _is_real_dir(WWW_DIR / u)}
+                known_uuids.difference_update(gone)
                 paths = [str(WWW_DIR / u) for u in known_uuids]
+            for u in gone:
+                logger.info(f"[{u}] Webspace no longer exists, unregistered")
 
             if not paths:
                 time.sleep(5)
@@ -237,7 +818,8 @@ def watch(config, logger):
 
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, errors="replace"
                 )
                 watcher_proc[0] = proc
             except Exception as e:
@@ -256,9 +838,11 @@ def watch(config, logger):
                 if not m:
                     continue
                 uuid = m.group(0)
-                flag = WWW_DIR / uuid / FLAG_FILE
                 try:
-                    content = flag.read_text().strip()
+                    content = read_flag(uuid)
+                except UnsafePath as e:
+                    logger.warning(f"[{uuid}] Ignoring unsafe {FLAG_FILE}: {e}")
+                    continue
                 except Exception:
                     continue
                 if content != "cache=stale":
@@ -293,11 +877,12 @@ def watch(config, logger):
         with uuid_lock:
             snapshot = set(known_uuids)
         for uuid in snapshot:
-            flag = WWW_DIR / uuid / FLAG_FILE
             try:
-                if flag.exists() and flag.read_text().strip() == "cache=stale":
+                if read_flag(uuid) == "cache=stale":
                     logger.info(f"[{uuid}] Startup: stale cache flag found")
                     _schedule_clear(uuid)
+            except UnsafePath as e:
+                logger.warning(f"[{uuid}] Ignoring unsafe {FLAG_FILE}: {e}")
             except Exception:
                 pass
 
@@ -314,7 +899,8 @@ def watch(config, logger):
         while True:
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, errors="replace"
                 )
             except FileNotFoundError:
                 logger.error("inotifywait not found — install inotify-tools: apt install inotify-tools")
